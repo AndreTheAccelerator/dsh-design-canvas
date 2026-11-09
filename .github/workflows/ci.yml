@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [20, 22]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+      - name: Syntax check (Host half + Client bundle)
+        run: |
+          node --check index.js
+          for file in host/*.js client.js; do node --check "$file"; done
+      - name: Model tests
+        run: node --test tests/model.test.mjs
