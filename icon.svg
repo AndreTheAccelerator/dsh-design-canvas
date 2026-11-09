@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" role="img" aria-label="Design canvas">
+  <rect x="2.75" y="3.75" width="18.5" height="13.5" rx="2.5" stroke="#4C6FFF" stroke-width="1.5"/>
+  <rect x="5.75" y="6.75" width="6" height="3.75" rx="0.9" fill="#4C6FFF"/>
+  <path d="M5.75 13.1h4.6M5.75 15.35h3" stroke="#4C6FFF" stroke-width="1.35" stroke-linecap="round"/>
+  <path d="M12.4 11.9l6.4 2.35-2.75 1.15-1.15 2.75-2.5-6.25z" fill="#F2A03D" stroke="#F2A03D" stroke-width="1.2" stroke-linejoin="round"/>
+  <circle cx="18.4" cy="19.3" r="1.9" fill="#E5484D"/>
+  <circle cx="18.4" cy="19.3" r="0.7" fill="#FFFFFF"/>
+</svg>

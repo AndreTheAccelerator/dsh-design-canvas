@@ -1,0 +1,81 @@
+{
+  "schemaVersion": 1,
+  "name": "Untitled design",
+  "version": 1,
+  "updatedAt": "2026-11-09T17:50:40.587Z",
+  "artboards": [
+    {
+      "id": "ab-landing",
+      "name": "Landing",
+      "x": 0,
+      "y": 0,
+      "width": 1200,
+      "height": 760,
+      "background": "#ffffff",
+      "layers": [
+        {
+          "id": "l-title",
+          "type": "text",
+          "name": "Title",
+          "x": 96,
+          "y": 120,
+          "width": 760,
+          "height": 72,
+          "text": "Design that speaks for itself",
+          "color": "#111827",
+          "fontSize": 56,
+          "fontWeight": 700,
+          "fontFamily": "system-ui, -apple-system, \"Segoe UI\", Roboto, sans-serif",
+          "align": "left",
+          "lineHeight": 64
+        },
+        {
+          "id": "l-subtitle",
+          "type": "text",
+          "name": "Subtitle",
+          "x": 96,
+          "y": 212,
+          "width": 640,
+          "height": 48,
+          "text": "Chat with your design assistant to compose and refine this page.",
+          "color": "#4b5563",
+          "fontSize": 20,
+          "fontWeight": 400,
+          "fontFamily": "system-ui, -apple-system, \"Segoe UI\", Roboto, sans-serif",
+          "align": "left",
+          "lineHeight": 32
+        },
+        {
+          "id": "l-cta",
+          "type": "rect",
+          "name": "Primary button",
+          "x": 96,
+          "y": 296,
+          "width": 196,
+          "height": 52,
+          "fill": "#111827",
+          "radius": 10,
+          "borderWidth": 0,
+          "borderColor": "#111827"
+        },
+        {
+          "id": "l-cta-label",
+          "type": "text",
+          "name": "Button label",
+          "x": 96,
+          "y": 310,
+          "width": 196,
+          "height": 24,
+          "text": "Start designing",
+          "color": "#ffffff",
+          "fontSize": 16,
+          "fontWeight": 600,
+          "fontFamily": "system-ui, -apple-system, \"Segoe UI\", Roboto, sans-serif",
+          "align": "center",
+          "lineHeight": 24
+        }
+      ]
+    }
+  ],
+  "comments": []
+}

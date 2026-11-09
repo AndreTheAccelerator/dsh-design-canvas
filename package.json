@@ -1,0 +1,57 @@
+{
+  "name": "@andretaccelerator/dsh-design-canvas",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Chat-paired design canvas for the DeepSeek Harness Web UI: artboard layers, CSS-like auto-layout frames, inline element comments, and agent-revisable direct manipulation",
+  "license": "MIT",
+  "type": "module",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "design-canvas",
+    "ai-agent",
+    "figma-like",
+    "artboard",
+    "flexbox"
+  ],
+  "scripts": {
+    "test": "node --test tests/model.test.mjs",
+    "check": "node --check index.js && node --check client.js && node --test tests/model.test.mjs"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "host/*.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-sidebar-right"
+      ]
+    }
+  },
+  "author": "Andre Accelerator <dreamsequence.zero@gmail.com>",
+  "homepage": "https://github.com/AndreTheAccelerator/dsh-design-canvas#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AndreTheAccelerator/dsh-design-canvas.git"
+  },
+  "bugs": {
+    "url": "https://github.com/AndreTheAccelerator/dsh-design-canvas/issues"
+  }
+}

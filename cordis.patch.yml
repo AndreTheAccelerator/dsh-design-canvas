@@ -1,0 +1,4 @@
+- insert:
+    - id: design-canvas
+      name: '@andretaccelerator/dsh-design-canvas'
+      config: {}
