@@ -1,5 +1,7 @@
 # Design canvas (plugin)
 
+**Repository:** <https://github.com/AndreTheAccelerator/dsh-design-canvas>
+
 A **chat-paired design canvas** for the DeepSeek Harness Web UI: a right-sidebar board with
 artboard-based editable layers, CSS-like auto-layout frames, inline element comments that become
 targeted chat messages, and Figma-style direct manipulation that the agent can revise with tools.
@@ -16,7 +18,8 @@ the single plain-JavaScript bundle `client.js`. There is no build step and no np
 
 ## Install from source
 
-1. `git clone <repository-url>` (or download and unpack the folder).
+1. `git clone https://github.com/AndreTheAccelerator/dsh-design-canvas.git` (or download and
+   unpack the folder).
 2. Install it into your Harness profile as a local bundle. From a Harness session, ask the agent to
    **install the bundle at** `<absolute path to this folder>`, or call the `plugin_manager` tool
    yourself with `action: "install_bundle"` and that path as `target`.
