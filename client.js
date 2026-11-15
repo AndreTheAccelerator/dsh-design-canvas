@@ -6516,7 +6516,9 @@ window.__ModuleLoader__.load({
      * ---------------------------------------------------------------------------------------- */
 
     return {
-      inject: ['slots'],
+      // Wait for the client services read below; otherwise apply() can run before
+      // the sidebar/session/locale providers mount and every ctx.get() is undefined.
+      inject: ['slots', 'sidebarRight', 'sidebarRightTabs', 'sessions', 'locale'],
       apply(ctx) {
         beacon('apply-start')
         const tabs = ctx.get('sidebarRightTabs')
