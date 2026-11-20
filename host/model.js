@@ -6,12 +6,13 @@
  * plus the optional `newId` / `nowIso` hooks supplied through `opts`.
  *
  * Geometry is in CSS px. Layers are stored back-to-front: the last layer in an artboard's
- * `layers` array paints on top. Layers are rect/ellipse/text/image leaves or `frame` containers
- * with `children` (nested, capped at MAX_FRAME_DEPTH) and an optional CSS-like `layout` object;
- * a frame with `layout: null` positions its children absolutely. The model only stores and
- * validates the layout description; the Client computes auto-layout child positions. Fills and
- * artboard backgrounds may be CSS gradients, layers may carry an optional CSS `shadow`, and text
- * layers accept `letterSpacing` / `textTransform`.
+ * `layers` array paints on top. Layers are rect/ellipse/text/image/line leaves or `frame` /
+ * `group` containers with `children` (nested, capped at MAX_FRAME_DEPTH). Frames may carry an
+ * optional CSS-like `layout` object; a frame with `layout: null` and every `group` position their
+ * children absolutely. The model only stores and validates the layout description; the Client
+ * computes auto-layout child positions. Fills and artboard backgrounds may be CSS gradients,
+ * layers may carry an optional CSS `shadow`, text layers accept `letterSpacing` / `textTransform`,
+ * and any layer accepts the optional `locked`, min/max size and `hugWidth` / `hugHeight` hints.
  * The store owns the persisted `version` / `updatedAt` fields; this module never bumps them and
  * never places `undefined` values in a document.
  *
@@ -21,9 +22,20 @@
  */
 
 export const SCHEMA_VERSION = 1
-export const LAYER_TYPES = Object.freeze(['rect', 'ellipse', 'text', 'image', 'frame'])
+export const LAYER_TYPES = Object.freeze([
+  'rect',
+  'ellipse',
+  'text',
+  'image',
+  'line',
+  'frame',
+  'group',
+])
+/** Container layer types own an ordered `children` array. */
+export const CONTAINER_TYPES = Object.freeze(['frame', 'group'])
 export const TEXT_ALIGNS = Object.freeze(['left', 'center', 'right'])
 export const IMAGE_FITS = Object.freeze(['cover', 'contain', 'fill'])
+export const LINE_ORIENTATIONS = Object.freeze(['horizontal', 'vertical', 'diagonal'])
 export const FONT_WEIGHTS = Object.freeze([400, 500, 600, 700])
 export const COMMENT_STATUSES = Object.freeze(['open', 'resolved'])
 
@@ -31,10 +43,29 @@ export const COMMENT_STATUSES = Object.freeze(['open', 'resolved'])
  * computes rendered child positions. */
 export const LAYOUT_DIRECTIONS = Object.freeze(['row', 'column'])
 export const LAYOUT_ALIGNS = Object.freeze(['start', 'center', 'end', 'stretch'])
-export const LAYOUT_JUSTIFIES = Object.freeze(['start', 'center', 'end', 'space-between'])
+export const LAYOUT_JUSTIFIES = Object.freeze([
+  'start',
+  'center',
+  'end',
+  'space-between',
+  'space-around',
+  'space-evenly',
+])
+export const LAYOUT_ALIGN_CONTENT = Object.freeze([
+  'start',
+  'center',
+  'end',
+  'stretch',
+  'space-between',
+  'space-around',
+])
 export const ALIGN_SELF_VALUES = Object.freeze(['start', 'center', 'end', 'stretch'])
 export const MAX_FRAME_DEPTH = 5
 export const MAX_CHILDREN_PER_FRAME = 200
+
+/* Line strokes: a straight stroke inside the layer's own box. */
+export const MIN_STROKE_WIDTH = 0.5
+export const MAX_STROKE_WIDTH = 64
 
 /* Small text style props (text layers only). */
 export const TEXT_TRANSFORMS = Object.freeze(['none', 'uppercase', 'lowercase'])
@@ -74,6 +105,14 @@ const COMMON_LAYER_KEYS = [
   'alignSelf',
   // Optional CSS box-shadow; absent by default, null/"" clears it.
   'shadow',
+  // Declared-only hints: the model stores them, the renderer applies them.
+  'locked',
+  'hugWidth',
+  'hugHeight',
+  'minWidth',
+  'minHeight',
+  'maxWidth',
+  'maxHeight',
 ]
 
 /** Property kind table shared by validation and normalization. */
@@ -86,6 +125,13 @@ const LAYER_PROP_KINDS = Object.freeze({
   opacity: 'opacity',
   visible: 'boolean',
   shadow: 'shadow',
+  locked: 'flag',
+  hugWidth: 'flag',
+  hugHeight: 'flag',
+  minWidth: 'bound',
+  minHeight: 'bound',
+  maxWidth: 'bound',
+  maxHeight: 'bound',
   fill: 'paint',
   radius: 'nonnegative',
   borderWidth: 'nonnegative',
@@ -101,11 +147,33 @@ const LAYER_PROP_KINDS = Object.freeze({
   textTransform: 'textTransform',
   src: 'src',
   fit: 'fit',
+  stroke: 'color',
+  strokeWidth: 'strokeWidth',
+  orientation: 'orientation',
+  dashed: 'boolean',
+  arrowStart: 'boolean',
+  arrowEnd: 'boolean',
   layout: 'layout',
   clip: 'boolean',
   grow: 'boolean',
   alignSelf: 'alignSelf',
 })
+
+/**
+ * Optional props that are removed (not stored) when they carry their "cleared" value: `shadow`
+ * clears on null/"" and the boolean hints clear on false (so documents stay small), while the
+ * min/max bounds clear on null. Every other prop is stored as coerced.
+ */
+const CLEARABLE_KEYS = new Set([
+  'shadow',
+  'locked',
+  'hugWidth',
+  'hugHeight',
+  'minWidth',
+  'minHeight',
+  'maxWidth',
+  'maxHeight',
+])
 
 const ARTBOARD_PROP_KINDS = Object.freeze({
   name: 'name',
@@ -132,25 +200,52 @@ const TYPE_PROPS = Object.freeze({
     'textTransform',
   ]),
   image: Object.freeze(['src', 'fit', 'radius']),
+  line: Object.freeze(['stroke', 'strokeWidth', 'orientation', 'dashed', 'arrowStart', 'arrowEnd']),
   frame: Object.freeze(['fill', 'radius', 'borderWidth', 'borderColor', 'clip', 'layout']),
+  // A group is a frame without a background, border or auto layout: children only.
+  group: Object.freeze(['clip']),
 })
 
 /** Layout object keys (a patch replaces the whole object) and its padding sides. */
-const LAYOUT_KEYS = Object.freeze(['direction', 'gap', 'padding', 'align', 'justify', 'wrap'])
+const LAYOUT_KEYS = Object.freeze([
+  'direction',
+  'gap',
+  'padding',
+  'rowGap',
+  'columnGap',
+  'align',
+  'alignContent',
+  'justify',
+  'wrap',
+])
 const PADDING_SIDES = Object.freeze(['top', 'right', 'bottom', 'left'])
 
 /** Keys accepted on each op object; anything else is rejected as `bad-property`. */
 const OP_KEYS = Object.freeze({
+  'board.update': Object.freeze(['type', 'patch']),
   'artboard.add': Object.freeze(['type', 'artboard', 'index']),
   'artboard.update': Object.freeze(['type', 'artboardId', 'patch']),
   'artboard.delete': Object.freeze(['type', 'artboardId']),
+  'artboard.duplicate': Object.freeze(['type', 'artboardId', 'name', 'offsetX', 'offsetY']),
   'layer.add': Object.freeze(['type', 'artboardId', 'parentId', 'layer', 'index']),
   'layer.update': Object.freeze(['type', 'layerId', 'patch']),
   'layer.delete': Object.freeze(['type', 'layerId']),
   'layer.reorder': Object.freeze(['type', 'layerId', 'index']),
   'layer.move_to': Object.freeze(['type', 'layerId', 'artboardId', 'parentId', 'index']),
+  'layer.duplicate': Object.freeze([
+    'type',
+    'layerId',
+    'offsetX',
+    'offsetY',
+    'parentId',
+    'artboardId',
+    'index',
+  ]),
+  'layer.group': Object.freeze(['type', 'layerIds', 'name', 'artboardId']),
+  'layer.ungroup': Object.freeze(['type', 'layerId']),
   'comment.add': Object.freeze(['type', 'artboardId', 'layerId', 'text', 'id']),
   'comment.update': Object.freeze(['type', 'commentId', 'status']),
+  'comment.batch_update': Object.freeze(['type', 'commentIds', 'status']),
   'comment.delete': Object.freeze(['type', 'commentId']),
 })
 
@@ -220,6 +315,11 @@ function allowedLayerProps(type) {
   return props
 }
 
+/** True when the layer is a container (frame or group) that owns a `children` array. */
+function isContainerLayer(layer) {
+  return isObject(layer) && CONTAINER_TYPES.includes(layer.type) && Array.isArray(layer.children)
+}
+
 function randomId(prefix) {
   const alphabet = 'abcdefghijklmnopqrstuvwxyz0123456789'
   let suffix = ''
@@ -275,6 +375,19 @@ function defaultLayer(type) {
       }
     case 'image':
       return { ...base, name: 'Image', width: 320, height: 200, src: '', fit: 'cover', radius: 0 }
+    case 'line':
+      return {
+        ...base,
+        name: 'Line',
+        width: 200,
+        height: 1,
+        stroke: '#94a3b8',
+        strokeWidth: 2,
+        orientation: 'horizontal',
+        dashed: false,
+        arrowStart: false,
+        arrowEnd: false,
+      }
     case 'frame':
       return {
         ...base,
@@ -289,6 +402,8 @@ function defaultLayer(type) {
         layout: null,
         children: [],
       }
+    case 'group':
+      return { ...base, name: 'Group', width: 400, height: 200, clip: false, children: [] }
     default:
       return { ...base }
   }
@@ -452,14 +567,37 @@ function coerceLayout(value) {
     return { ok: false, message: '"layout.align" must be one of start, center, end, stretch' }
   }
 
+  const alignContent = value.alignContent === undefined ? 'stretch' : value.alignContent
+  if (!LAYOUT_ALIGN_CONTENT.includes(alignContent)) {
+    return {
+      ok: false,
+      message:
+        '"layout.alignContent" must be one of start, center, end, stretch, space-between, space-around',
+    }
+  }
+
   const justify = value.justify === undefined ? 'start' : value.justify
   if (!LAYOUT_JUSTIFIES.includes(justify)) {
-    return { ok: false, message: '"layout.justify" must be one of start, center, end, space-between' }
+    return {
+      ok: false,
+      message:
+        '"layout.justify" must be one of start, center, end, space-between, space-around, space-evenly',
+    }
   }
 
   const wrap = value.wrap === undefined ? false : value.wrap
   if (typeof wrap !== 'boolean') {
     return { ok: false, message: '"layout.wrap" must be true or false' }
+  }
+
+  // Row/column gaps override `gap` when present; absent means "use gap".
+  const gaps = {}
+  for (const key of ['rowGap', 'columnGap']) {
+    if (value[key] === undefined) continue
+    if (!isFiniteNumber(value[key]) || value[key] < 0) {
+      return { ok: false, message: `"layout.${key}" must be a finite number >= 0 (px)` }
+    }
+    gaps[key] = value[key]
   }
 
   const rawPadding = value.padding === undefined || value.padding === null ? {} : value.padding
@@ -490,7 +628,19 @@ function coerceLayout(value) {
     padding[side] = sideValue
   }
 
-  return { ok: true, value: { direction, gap, padding, align, justify, wrap } }
+  return {
+    ok: true,
+    value: {
+      direction,
+      gap,
+      padding,
+      ...gaps,
+      align,
+      alignContent,
+      justify,
+      wrap,
+    },
+  }
 }
 
 /** Shared safety check for stored CSS style strings (colors, gradients, shadows). */
@@ -629,6 +779,35 @@ function coerceProp(key, kind, value) {
       if (typeof value !== 'boolean') return { ok: false, message: `"${key}" must be true or false` }
       return { ok: true, value }
     }
+    case 'flag': {
+      // Optional boolean flag: true is stored, false clears it (absent means false).
+      if (value === true) return { ok: true, value: true }
+      if (value === false || value === null) return { ok: true, value: null }
+      return { ok: false, message: `"${key}" must be true or false` }
+    }
+    case 'bound': {
+      // Optional min/max size hint: a number >= 0, or null to clear it.
+      if (value === null) return { ok: true, value: null }
+      if (!isFiniteNumber(value)) {
+        return { ok: false, message: `"${key}" must be a finite number >= 0 (px)` }
+      }
+      return { ok: true, value: Math.max(0, value) }
+    }
+    case 'strokeWidth': {
+      if (!isFiniteNumber(value)) {
+        return {
+          ok: false,
+          message: `"${key}" must be a finite number (px, ${MIN_STROKE_WIDTH}..${MAX_STROKE_WIDTH})`,
+        }
+      }
+      return { ok: true, value: clamp(value, MIN_STROKE_WIDTH, MAX_STROKE_WIDTH) }
+    }
+    case 'orientation': {
+      if (!LINE_ORIENTATIONS.includes(value)) {
+        return { ok: false, message: `"${key}" must be one of ${LINE_ORIENTATIONS.join(', ')}` }
+      }
+      return { ok: true, value }
+    }
     case 'fontWeight': {
       if (!FONT_WEIGHTS.includes(value)) {
         return { ok: false, message: `"${key}" must be one of 400, 500, 600, 700` }
@@ -663,6 +842,27 @@ function coerceProp(key, kind, value) {
 }
 
 /**
+ * Reject a min size larger than the matching max size. `props` is the effective (merged) layer
+ * state, so a patch that only sets one side is checked against the stored other side.
+ */
+function boundsConflict(props) {
+  const pairs = [
+    ['minWidth', 'maxWidth'],
+    ['minHeight', 'maxHeight'],
+  ]
+  for (const [minKey, maxKey] of pairs) {
+    if (
+      isFiniteNumber(props[minKey]) &&
+      isFiniteNumber(props[maxKey]) &&
+      props[minKey] > props[maxKey]
+    ) {
+      return `"${minKey}" (${fmt(props[minKey])}) must not be greater than "${maxKey}" (${fmt(props[maxKey])})`
+    }
+  }
+  return null
+}
+
+/**
  * Validate + coerce every own property of `source` against `kindMap`, then assign the coerced
  * values onto `target` only when the whole set is valid. This keeps a rejected patch from
  * leaving a half-applied layer behind.
@@ -673,10 +873,15 @@ function assignProps(target, source, kindMap) {
   for (const key of Object.keys(source)) {
     const result = coerceProp(key, kindMap[key], source[key])
     if (!result.ok) return err(result.code ?? 'bad-value', result.message)
-    // `shadow: null` / `shadow: ""` clears the optional prop instead of storing a null value.
-    if (key === 'shadow' && result.value === null) clears.push(key)
+    // `shadow: null` / `locked: false` / `maxWidth: null` clears the optional prop instead of
+    // storing the cleared value.
+    if (CLEARABLE_KEYS.has(key) && result.value === null) clears.push(key)
     else values[key] = result.value
   }
+  const merged = { ...target, ...values }
+  for (const key of clears) delete merged[key]
+  const conflict = boundsConflict(merged)
+  if (conflict) return err('bad-value', conflict)
   Object.assign(target, values)
   for (const key of clears) delete target[key]
   return null
@@ -714,12 +919,12 @@ function findArtboard(doc, artboardId) {
 }
 
 /**
- * Depth-first layer lookup across artboards and nested frames.
+ * Depth-first layer lookup across artboards and nested containers.
  *
  * @returns {null | { layer: object, index: number, parent: object[], artboard: object,
  *   artboardIndex: number, parentLayer: object | null, depth: number }} `parent` is the array
- *   that owns the layer (an artboard's `layers` or a frame's `children`); `depth` is 1 for
- *   top-level layers and grows by one per frame nesting level.
+ *   that owns the layer (an artboard's `layers` or a frame/group's `children`); `depth` is 1 for
+ *   top-level layers and grows by one per container nesting level.
  */
 function findLayer(doc, layerId) {
   if (typeof layerId !== 'string' || !layerId) return null
@@ -739,7 +944,7 @@ function findLayerInList(list, layerId, artboard, artboardIndex, parentLayer, de
     if (layer.id === layerId) {
       return { layer, index, parent: list, artboard, artboardIndex, parentLayer, depth }
     }
-    if (layer.type === 'frame' && Array.isArray(layer.children) && layer.children.length) {
+    if (isContainerLayer(layer) && layer.children.length) {
       const found = findLayerInList(
         layer.children,
         layerId,
@@ -754,11 +959,11 @@ function findLayerInList(list, layerId, artboard, artboardIndex, parentLayer, de
   return null
 }
 
-/** True when `id` belongs to `layer` or to any of its nested frame children. */
+/** True when `id` belongs to `layer` or to any of its nested container children. */
 function layerIdTaken(layer, id) {
   if (!isObject(layer)) return false
   if (layer.id === id) return true
-  if (layer.type === 'frame' && Array.isArray(layer.children)) {
+  if (isContainerLayer(layer)) {
     for (const child of layer.children) {
       if (layerIdTaken(child, id)) return true
     }
@@ -785,7 +990,7 @@ function idTaken(doc, id) {
 function collectLayerIds(layer, target) {
   if (!isObject(layer)) return
   if (typeof layer.id === 'string') target.add(layer.id)
-  if (layer.type === 'frame' && Array.isArray(layer.children)) {
+  if (isContainerLayer(layer)) {
     for (const child of layer.children) collectLayerIds(child, target)
   }
 }
@@ -793,7 +998,7 @@ function collectLayerIds(layer, target) {
 /** Number of layer levels occupied by a subtree (a leaf is 1). */
 function subtreeHeight(layer) {
   let height = 1
-  if (isObject(layer) && layer.type === 'frame' && Array.isArray(layer.children)) {
+  if (isContainerLayer(layer)) {
     for (const child of layer.children) {
       const nested = subtreeHeight(child) + 1
       if (nested > height) height = nested
@@ -806,7 +1011,7 @@ function subtreeHeight(layer) {
 function subtreeContains(layer, id) {
   if (!isObject(layer)) return false
   if (layer.id === id) return true
-  if (layer.type === 'frame' && Array.isArray(layer.children)) {
+  if (isContainerLayer(layer)) {
     for (const child of layer.children) {
       if (subtreeContains(child, id)) return true
     }
@@ -836,6 +1041,78 @@ function resolveId(doc, prefix, requested, newId) {
     if (typeof candidate === 'string' && candidate && !idTaken(doc, candidate)) return candidate
   }
   return err('bad-id', `could not allocate a unique ${prefix} id`)
+}
+
+/**
+ * Allocate a fresh id for a cloned subtree, avoiding ids that are already in the document and
+ * ids handed out earlier in the same clone pass (`used`).
+ *
+ * @returns {{ ok: true, value: string } | { ok: false, code: string, message: string }}
+ */
+function allocateFreshId(doc, used, context, prefix) {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    let candidate
+    try {
+      candidate = context.newId(prefix)
+    } catch {
+      candidate = undefined
+    }
+    if (
+      typeof candidate === 'string' &&
+      candidate &&
+      !used.has(candidate) &&
+      !idTaken(doc, candidate)
+    ) {
+      used.add(candidate)
+      return { ok: true, value: candidate }
+    }
+  }
+  return err('bad-id', `could not allocate a unique ${prefix} id`)
+}
+
+/**
+ * Deep-copy a layer subtree with fresh globally unique ids. Every other prop is preserved
+ * losslessly and comment references are intentionally not carried over.
+ *
+ * @returns {{ ok: true, layer: object } | { ok: false, code: string, message: string }}
+ */
+function cloneLayerTree(doc, layer, used, context) {
+  if (!isObject(layer)) return err('bad-value', 'cannot duplicate a non-object layer')
+  const id = allocateFreshId(doc, used, context, 'l')
+  if (!id.ok) return id
+  const { children, ...rest } = layer
+  const copy = clone(rest)
+  copy.id = id.value
+  if (Array.isArray(children)) {
+    copy.children = []
+    for (const child of children.slice(0, MAX_CHILDREN_PER_FRAME)) {
+      if (!isObject(child)) continue
+      const cloned = cloneLayerTree(doc, child, used, context)
+      if (!cloned.ok) return cloned
+      copy.children.push(cloned.layer)
+    }
+  }
+  return { ok: true, layer: copy }
+}
+
+/** Read optional `offsetX` / `offsetY` from a duplicate op, defaulting to `dx` / `dy`. */
+function readOffsets(op, dx, dy) {
+  let offsetX = dx
+  let offsetY = dy
+  if (op.offsetX !== undefined) {
+    if (!isFiniteNumber(op.offsetX)) return err('bad-value', 'offsetX must be a finite number (px)')
+    offsetX = op.offsetX
+  }
+  if (op.offsetY !== undefined) {
+    if (!isFiniteNumber(op.offsetY)) return err('bad-value', 'offsetY must be a finite number (px)')
+    offsetY = op.offsetY
+  }
+  return { ok: true, offsetX, offsetY }
+}
+
+/** Lower bound for a union box (a group must stay at least 1x1). */
+function extent(start, size) {
+  return numberOr(start, 0) + Math.max(1, numberOr(size, 1))
 }
 
 /* --------------------------------------------------------------------------------------------
@@ -905,10 +1182,12 @@ function deleteArtboard(doc, op) {
 }
 
 /**
- * Resolve the list that receives a new layer. `layer.add` targets either an artboard's top-level
- * `layers` (by `artboardId`) or one frame's `children` (by `parentId`); exactly one is required.
+ * Resolve the list that receives a new layer. `layer.add` / `layer.duplicate` target either an
+ * artboard's top-level `layers` (by `artboardId`) or one container layer's `children` (by
+ * `parentId`); exactly one is required. `depth` is the depth of the receiving container
+ * (0 for an artboard, the container's own depth for a frame/group).
  */
-function resolveAddTarget(doc, op, context) {
+function resolveWriteTarget(doc, op, context) {
   const hasArtboard = typeof op.artboardId === 'string' && op.artboardId !== ''
   const hasParent = typeof op.parentId === 'string' && op.parentId !== ''
   if (op.artboardId !== undefined && op.artboardId !== null && !hasArtboard) {
@@ -920,13 +1199,13 @@ function resolveAddTarget(doc, op, context) {
   if (hasArtboard && hasParent) {
     return err(
       'bad-request',
-      'layer.add takes exactly one of `artboardId` (top level) or `parentId` (inside a frame)',
+      'pass exactly one of `artboardId` (top level) or `parentId` (inside a frame or group)',
     )
   }
   if (!hasArtboard && !hasParent) {
     return err(
       'bad-request',
-      'layer.add needs `artboardId` for a top-level layer or `parentId` for a layer inside a frame',
+      'pass `artboardId` for a top-level layer or `parentId` for a layer inside a frame or group',
     )
   }
 
@@ -935,26 +1214,27 @@ function resolveAddTarget(doc, op, context) {
     if (!parentFound) {
       return err('bad-id', `layer "${String(op.parentId)}" does not exist; call design_read for ids`)
     }
-    if (parentFound.layer.type !== 'frame') {
+    if (!CONTAINER_TYPES.includes(parentFound.layer.type)) {
       return err(
         'bad-value',
-        `layer "${op.parentId}" is a ${parentFound.layer.type}, not a frame; only frames have children`,
+        `layer "${op.parentId}" is a ${parentFound.layer.type}, not a frame or group; only those have children`,
       )
     }
     if (parentFound.depth >= MAX_FRAME_DEPTH) {
       return err(
         'limit',
-        `frame nesting is limited to ${MAX_FRAME_DEPTH} levels; "${op.parentId}" is already at depth ${parentFound.depth}`,
+        `layer nesting is limited to ${MAX_FRAME_DEPTH} levels; "${op.parentId}" is already at depth ${parentFound.depth}`,
       )
     }
-    const parentFrame = parentFound.layer
-    if (!Array.isArray(parentFrame.children)) parentFrame.children = []
+    const parentLayer = parentFound.layer
+    if (!Array.isArray(parentLayer.children)) parentLayer.children = []
     return {
       ok: true,
-      list: parentFrame.children,
+      list: parentLayer.children,
       limit: MAX_CHILDREN_PER_FRAME,
-      label: `frame "${parentFrame.id}"`,
+      label: `${parentLayer.type} "${parentLayer.id}"`,
       kind: 'children',
+      depth: parentFound.depth,
     }
   }
 
@@ -966,11 +1246,12 @@ function resolveAddTarget(doc, op, context) {
     limit: context.maxLayersPerArtboard,
     label: `artboard "${found.artboard.id}"`,
     kind: 'layers',
+    depth: 0,
   }
 }
 
 function addLayer(doc, op, context) {
-  const target = resolveAddTarget(doc, op, context)
+  const target = resolveWriteTarget(doc, op, context)
   if (!target.ok) return target
   if (!isObject(op.layer)) return err('bad-request', 'layer.add needs a `layer` object')
   const layerType = op.layer.type
@@ -986,7 +1267,7 @@ function addLayer(doc, op, context) {
     if (key === 'children') {
       return err(
         'bad-property',
-        'layer.add does not take `children`; add the frame first, then add each child with layer.add {parentId: "<frame id>"}',
+        'layer.add does not take `children`; add the frame/group first, then add each child with layer.add {parentId: "<container id>"}',
       )
     }
     if (!allowed.has(key)) {
@@ -998,14 +1279,19 @@ function addLayer(doc, op, context) {
   }
 
   const layer = { id: '', ...defaultLayer(layerType) }
+  const values = {}
   for (const key of Object.keys(op.layer)) {
     if (key === 'id' || key === 'type') continue
     const result = coerceProp(key, LAYER_PROP_KINDS[key], op.layer[key])
     if (!result.ok) return err(result.code ?? 'bad-value', result.message)
-    if (key === 'shadow' && result.value === null) continue
-    layer[key] = result.value
+    // Cleared optional props (shadow, locked:false, min/max:null) stay absent.
+    if (CLEARABLE_KEYS.has(key) && result.value === null) continue
+    values[key] = result.value
   }
-  if (layerType === 'frame' && !Array.isArray(layer.children)) layer.children = []
+  const conflict = boundsConflict({ ...layer, ...values })
+  if (conflict) return err('bad-value', conflict)
+  Object.assign(layer, values)
+  if (CONTAINER_TYPES.includes(layerType) && !Array.isArray(layer.children)) layer.children = []
 
   const id = resolveId(doc, 'l', op.layer.id, context.newId)
   if (typeof id !== 'string') return id
@@ -1094,17 +1380,17 @@ function moveLayer(doc, op, context) {
     if (!parentFound) {
       return err('bad-id', `layer "${String(op.parentId)}" does not exist; call design_read for ids`)
     }
-    if (parentFound.layer.type !== 'frame') {
+    if (!CONTAINER_TYPES.includes(parentFound.layer.type)) {
       return err(
         'bad-value',
-        `layer "${op.parentId}" is a ${parentFound.layer.type}, not a frame; only frames have children`,
+        `layer "${op.parentId}" is a ${parentFound.layer.type}, not a frame or group; only those have children`,
       )
     }
     targetParentLayer = parentFound.layer
     if (!Array.isArray(targetParentLayer.children)) targetParentLayer.children = []
     targetList = targetParentLayer.children
     targetLimit = MAX_CHILDREN_PER_FRAME
-    targetLabel = `frame "${targetParentLayer.id}"`
+    targetLabel = `${targetParentLayer.type} "${targetParentLayer.id}"`
     targetKind = 'children'
     targetDepth = parentFound.depth
   } else {
@@ -1131,13 +1417,13 @@ function moveLayer(doc, op, context) {
   }
 
   if (targetParentLayer && subtreeContains(found.layer, targetParentLayer.id)) {
-    return err('bad-value', 'cannot move a frame into itself or one of its own descendants')
+    return err('bad-value', 'cannot move a layer into itself or one of its own descendants')
   }
   const height = subtreeHeight(found.layer)
   if (targetDepth + height > MAX_FRAME_DEPTH) {
     return err(
       'limit',
-      `moving "${found.layer.id}" there would exceed the ${MAX_FRAME_DEPTH}-level frame nesting limit`,
+      `moving "${found.layer.id}" there would exceed the ${MAX_FRAME_DEPTH}-level layer nesting limit`,
     )
   }
   if (targetList.length >= targetLimit) {
@@ -1151,6 +1437,329 @@ function moveLayer(doc, op, context) {
   const [moved] = found.parent.splice(found.index, 1)
   targetList.splice(position.index, 0, moved)
   return { ok: true, id: found.layer.id }
+}
+
+/* --------------------------------------------------------------------------------------------
+ * v2 op handlers: board rename, duplicates, grouping, batch comment updates
+ * ------------------------------------------------------------------------------------------ */
+
+/** Coerce an optional human name, rejecting empty/whitespace-only values. */
+function coerceOptionalName(value) {
+  if (value === undefined) return { ok: true, value: undefined }
+  const coerced = coerceProp('name', 'name', value)
+  if (!coerced.ok) return err('bad-value', coerced.message)
+  const name = String(coerced.value).trim()
+  if (!name) return err('bad-value', 'name must not be empty')
+  return { ok: true, value: name.slice(0, MAX_NAME) }
+}
+
+/** `board.update { patch: { name } }`: rename the design (the "project"). */
+function updateBoard(doc, op) {
+  if (!isObject(op.patch)) return err('bad-request', 'board.update needs a `patch` object')
+  const allowed = new Set(['name'])
+  const unknown = checkUnknownProps(op.patch, allowed, 'board patch')
+  if (unknown) return unknown
+  if (!hasOwn(op.patch, 'name')) return { ok: true }
+  const nameResult = coerceOptionalName(op.patch.name)
+  if (!nameResult.ok) return nameResult
+  if (!nameResult.value) return err('bad-value', 'board name must not be empty')
+  doc.name = nameResult.value
+  return { ok: true }
+}
+
+/** `artboard.duplicate { artboardId, name?, offsetX?, offsetY? }`: copy a board flush right after it. */
+function duplicateArtboard(doc, op, context) {
+  const found = findArtboard(doc, op.artboardId)
+  if (!found) return err('bad-id', `artboard "${String(op.artboardId)}" does not exist; call design_read for ids`)
+  if (doc.artboards.length >= MAX_ARTBOARDS) {
+    return err('limit', `the document already has ${MAX_ARTBOARDS} artboards (maximum)`)
+  }
+  const offsets = readOffsets(op, 80, 80)
+  if (!offsets.ok) return offsets
+  const nameResult = coerceOptionalName(op.name)
+  if (!nameResult.ok) return nameResult
+  const sourceName =
+    typeof found.artboard.name === 'string' && found.artboard.name.trim()
+      ? found.artboard.name.trim()
+      : 'Untitled artboard'
+  const name = nameResult.value ?? `${sourceName.slice(0, MAX_NAME - 5)} copy`
+
+  const used = new Set()
+  const idResult = allocateFreshId(doc, used, context, 'ab')
+  if (!idResult.ok) return idResult
+
+  const { layers: sourceLayers, ...rest } = found.artboard
+  const copy = clone(rest)
+  copy.id = idResult.value
+  copy.name = name
+  copy.x = numberOr(copy.x, 0) + offsets.offsetX
+  copy.y = numberOr(copy.y, 0) + offsets.offsetY
+  copy.layers = []
+  const rawLayers = Array.isArray(sourceLayers) ? sourceLayers : []
+  for (const layer of rawLayers.slice(0, context.maxLayersPerArtboard)) {
+    if (!isObject(layer)) continue
+    const cloned = cloneLayerTree(doc, layer, used, context)
+    if (!cloned.ok) return cloned
+    copy.layers.push(cloned.layer)
+  }
+  doc.artboards.splice(found.index + 1, 0, copy)
+  return { ok: true, id: copy.id }
+}
+
+/** `layer.duplicate { layerId, offsetX?, offsetY?, parentId?|artboardId?, index? }`. */
+function duplicateLayer(doc, op, context) {
+  const found = findLayer(doc, op.layerId)
+  if (!found) return err('bad-id', `layer "${String(op.layerId)}" does not exist; call design_read for ids`)
+  const offsets = readOffsets(op, 16, 16)
+  if (!offsets.ok) return offsets
+  for (const key of ['artboardId', 'parentId']) {
+    if (op[key] !== undefined && op[key] !== null && (typeof op[key] !== 'string' || !op[key])) {
+      return err('bad-id', `${key} must be a non-empty string`)
+    }
+  }
+  const hasDestination =
+    (typeof op.artboardId === 'string' && op.artboardId !== '') ||
+    (typeof op.parentId === 'string' && op.parentId !== '')
+  let list
+  let limit
+  let label
+  let kind
+  let wantedIndex
+  if (hasDestination) {
+    const target = resolveWriteTarget(doc, op, context)
+    if (!target.ok) return target
+    if (op.parentId !== undefined && subtreeContains(found.layer, op.parentId)) {
+      return err(
+        'bad-op',
+        `cannot duplicate "${found.layer.id}" into itself or one of its own descendants`,
+      )
+    }
+    if (target.depth + subtreeHeight(found.layer) > MAX_FRAME_DEPTH) {
+      return err(
+        'limit',
+        `duplicating "${found.layer.id}" there would exceed the ${MAX_FRAME_DEPTH}-level layer nesting limit`,
+      )
+    }
+    list = target.list
+    limit = target.limit
+    label = target.label
+    kind = target.kind
+    wantedIndex = op.index === undefined ? (list === found.parent ? found.index + 1 : list.length) : op.index
+  } else {
+    list = found.parent
+    if (found.parentLayer) {
+      limit = MAX_CHILDREN_PER_FRAME
+      label = `${found.parentLayer.type} "${found.parentLayer.id}"`
+      kind = 'children'
+    } else {
+      limit = context.maxLayersPerArtboard
+      label = `artboard "${found.artboard.id}"`
+      kind = 'layers'
+    }
+    wantedIndex = op.index === undefined ? found.index + 1 : op.index
+  }
+  if (list.length >= limit) {
+    return err('limit', `${label} already has ${limit} ${kind} (maximum)`)
+  }
+
+  const cloned = cloneLayerTree(doc, found.layer, new Set(), context)
+  if (!cloned.ok) return cloned
+  const copy = cloned.layer
+  copy.x = numberOr(copy.x, 0) + offsets.offsetX
+  copy.y = numberOr(copy.y, 0) + offsets.offsetY
+
+  const position = clampIndex(wantedIndex, list.length)
+  if (!position.ok) return position
+  list.splice(position.index, 0, copy)
+  return { ok: true, id: copy.id }
+}
+
+/**
+ * `layer.group { layerIds, name?, artboardId? }`: wrap sibling layers into one absolute group at
+ * the union of their boxes, keeping their relative geometry and z-order.
+ */
+function groupLayers(doc, op, context) {
+  if (!Array.isArray(op.layerIds)) return err('bad-request', 'layer.group needs a `layerIds` array')
+  const ids = op.layerIds
+  if (ids.length < 1) return err('bad-value', 'layer.group needs at least one layer id in `layerIds`')
+  const seen = new Set()
+  for (const id of ids) {
+    if (typeof id !== 'string' || !id) return err('bad-id', 'layerIds must be non-empty strings')
+    if (seen.has(id)) {
+      return err('bad-value', `layer "${id}" is listed more than once in layerIds`)
+    }
+    seen.add(id)
+  }
+
+  const members = []
+  const missing = []
+  for (const id of ids) {
+    const member = findLayer(doc, id)
+    if (member) members.push(member)
+    else missing.push(id)
+  }
+  if (missing.length) {
+    const list = missing.map((id) => `"${id}"`).join(', ')
+    return err(
+      'bad-id',
+      `layer${plural(missing.length)} ${list} ${missing.length === 1 ? 'does' : 'do'} not exist; call design_read for ids`,
+    )
+  }
+
+  const parentList = members[0].parent
+  for (const member of members) {
+    if (member.parent !== parentList) {
+      return err(
+        'bad-op',
+        'layer.group needs layers that share one parent; move them into the same artboard, frame or group first',
+      )
+    }
+  }
+  if (op.artboardId !== undefined && op.artboardId !== null) {
+    if (typeof op.artboardId !== 'string' || !op.artboardId) {
+      return err('bad-id', 'artboardId must be a non-empty string')
+    }
+    if (op.artboardId !== members[0].artboard.id) {
+      return err(
+        'bad-id',
+        `the selected layers are on artboard "${members[0].artboard.id}", not "${op.artboardId}"`,
+      )
+    }
+  }
+  const parentLayer = members[0].parentLayer
+  if (parentLayer && isObject(parentLayer.layout)) {
+    return err(
+      'bad-op',
+      `layer.group cannot group children of an auto-layout frame ("${parentLayer.id}"); set its layout to null or group them directly in the artboard`,
+    )
+  }
+  if (members.length > MAX_CHILDREN_PER_FRAME) {
+    return err('limit', `a group holds at most ${MAX_CHILDREN_PER_FRAME} layers (received ${members.length})`)
+  }
+  const depth = members[0].depth
+  for (const member of members) {
+    if (depth + subtreeHeight(member.layer) > MAX_FRAME_DEPTH) {
+      return err(
+        'limit',
+        `grouping "${member.layer.id}" would exceed the ${MAX_FRAME_DEPTH}-level layer nesting limit`,
+      )
+    }
+  }
+
+  const nameResult = coerceOptionalName(op.name)
+  if (!nameResult.ok) return nameResult
+
+  let minX = Infinity
+  let minY = Infinity
+  let maxX = -Infinity
+  let maxY = -Infinity
+  for (const member of members) {
+    const layer = member.layer
+    const x = numberOr(layer.x, 0)
+    const y = numberOr(layer.y, 0)
+    minX = Math.min(minX, x)
+    minY = Math.min(minY, y)
+    maxX = Math.max(maxX, extent(x, layer.width))
+    maxY = Math.max(maxY, extent(y, layer.height))
+  }
+  const width = Math.max(1, maxX - minX)
+  const height = Math.max(1, maxY - minY)
+
+  const idResult = allocateFreshId(doc, new Set(), context, 'l')
+  if (!idResult.ok) return idResult
+
+  // Remove the members back-to-front so the remaining indices stay valid, and remember where the
+  // group belongs (the slot of the topmost member).
+  const ordered = [...members].sort((a, b) => a.index - b.index)
+  const removed = new Set(ordered.map((member) => member.index))
+  const topIndex = ordered[ordered.length - 1].index
+  let insertAt = 0
+  for (let index = 0; index < topIndex; index += 1) {
+    if (!removed.has(index)) insertAt += 1
+  }
+  for (let offset = ordered.length - 1; offset >= 0; offset -= 1) {
+    parentList.splice(ordered[offset].index, 1)
+  }
+
+  const group = {
+    id: idResult.value,
+    ...defaultLayer('group'),
+    name: nameResult.value ?? 'Group',
+    x: minX,
+    y: minY,
+    width,
+    height,
+  }
+  for (const member of ordered) {
+    const layer = member.layer
+    layer.x = numberOr(layer.x, 0) - minX
+    layer.y = numberOr(layer.y, 0) - minY
+    group.children.push(layer)
+  }
+  parentList.splice(insertAt, 0, group)
+  return { ok: true, id: group.id }
+}
+
+/** `layer.ungroup { layerId }`: dissolve a group, promoting its children in place. */
+function ungroupLayer(doc, op, context) {
+  const found = findLayer(doc, op.layerId)
+  if (!found) return err('bad-id', `layer "${String(op.layerId)}" does not exist; call design_read for ids`)
+  if (found.layer.type !== 'group') {
+    const hint =
+      found.layer.type === 'frame'
+        ? '; a frame cannot be ungrouped, move its children out or delete it'
+        : ''
+    return err(
+      'bad-op',
+      `layer.ungroup only works on type "group"; "${found.layer.id}" is a ${found.layer.type}${hint}`,
+    )
+  }
+  const children = (Array.isArray(found.layer.children) ? found.layer.children : []).filter(isObject)
+  const limit = found.parentLayer ? MAX_CHILDREN_PER_FRAME : context.maxLayersPerArtboard
+  if (found.parent.length - 1 + children.length > limit) {
+    return err('limit', `ungrouping "${found.layer.id}" would exceed the ${limit}-layer parent limit`)
+  }
+  const originX = numberOr(found.layer.x, 0)
+  const originY = numberOr(found.layer.y, 0)
+  for (const child of children) {
+    child.x = numberOr(child.x, 0) + originX
+    child.y = numberOr(child.y, 0) + originY
+  }
+  found.parent.splice(found.index, 1, ...children)
+  doc.comments = doc.comments.filter(
+    (comment) => !isObject(comment) || comment.layerId !== found.layer.id,
+  )
+  return { ok: true, id: found.layer.id }
+}
+
+/** `comment.batch_update { commentIds, status }`: one op, one error listing every missing id. */
+function batchUpdateComments(doc, op) {
+  if (!Array.isArray(op.commentIds)) {
+    return err('bad-request', 'comment.batch_update needs a `commentIds` array')
+  }
+  if (!COMMENT_STATUSES.includes(op.status)) {
+    return err('bad-value', 'comment.batch_update needs `status` set to "open" or "resolved"')
+  }
+  const targets = []
+  const missing = []
+  const seen = new Set()
+  for (const id of op.commentIds) {
+    if (typeof id !== 'string' || !id) return err('bad-id', 'commentIds must be non-empty strings')
+    if (seen.has(id)) continue
+    seen.add(id)
+    const comment = doc.comments.find((entry) => isObject(entry) && entry.id === id)
+    if (comment) targets.push(comment)
+    else missing.push(id)
+  }
+  if (missing.length) {
+    const list = missing.map((id) => `"${id}"`).join(', ')
+    return err(
+      'bad-id',
+      `comment${plural(missing.length)} ${list} ${missing.length === 1 ? 'does' : 'do'} not exist; no comment was updated`,
+    )
+  }
+  for (const comment of targets) comment.status = op.status
+  return { ok: true }
 }
 
 function addComment(doc, op, context) {
@@ -1243,12 +1852,16 @@ function applyOne(doc, op, context) {
     }
   }
   switch (type) {
+    case 'board.update':
+      return updateBoard(doc, op)
     case 'artboard.add':
       return addArtboard(doc, op, context)
     case 'artboard.update':
       return updateArtboard(doc, op)
     case 'artboard.delete':
       return deleteArtboard(doc, op)
+    case 'artboard.duplicate':
+      return duplicateArtboard(doc, op, context)
     case 'layer.add':
       return addLayer(doc, op, context)
     case 'layer.update':
@@ -1259,10 +1872,18 @@ function applyOne(doc, op, context) {
       return reorderLayer(doc, op)
     case 'layer.move_to':
       return moveLayer(doc, op, context)
+    case 'layer.duplicate':
+      return duplicateLayer(doc, op, context)
+    case 'layer.group':
+      return groupLayers(doc, op, context)
+    case 'layer.ungroup':
+      return ungroupLayer(doc, op, context)
     case 'comment.add':
       return addComment(doc, op, context)
     case 'comment.update':
       return updateComment(doc, op)
+    case 'comment.batch_update':
+      return batchUpdateComments(doc, op)
     case 'comment.delete':
       return deleteComment(doc, op)
     default:
@@ -1408,12 +2029,21 @@ function normalizeLayer(raw, counter, usedLayerIds, depth) {
     if (!hasOwn(LAYER_PROP_KINDS, key) || !allowed.has(key)) continue
     const result = coerceProp(key, LAYER_PROP_KINDS[key], raw[key])
     if (!result.ok) continue
-    // Invalid/cleared shadows are dropped instead of inserting a default; old boards stay as-is.
-    if (key === 'shadow' && result.value === null) continue
+    // Invalid/cleared optional props are dropped instead of inserting a default.
+    if (CLEARABLE_KEYS.has(key) && result.value === null) continue
     layer[key] = result.value
   }
+  // Repair an impossible min > max pair by dropping the conflicting bounds.
+  if (isFiniteNumber(layer.minWidth) && isFiniteNumber(layer.maxWidth) && layer.minWidth > layer.maxWidth) {
+    delete layer.minWidth
+    delete layer.maxWidth
+  }
+  if (isFiniteNumber(layer.minHeight) && isFiniteNumber(layer.maxHeight) && layer.minHeight > layer.maxHeight) {
+    delete layer.minHeight
+    delete layer.maxHeight
+  }
 
-  if (type === 'frame') {
+  if (CONTAINER_TYPES.includes(type)) {
     const rawChildren = Array.isArray(raw.children) ? raw.children.slice(0, MAX_CHILDREN_PER_FRAME) : []
     for (const rawChild of rawChildren) {
       const child = normalizeLayer(rawChild, counter, usedLayerIds, depth + 1)
@@ -1429,7 +2059,7 @@ function indexLayerArtboards(layers, artboardId, target) {
   for (const layer of layers) {
     if (!isObject(layer)) continue
     if (typeof layer.id === 'string') target.set(layer.id, artboardId)
-    if (layer.type === 'frame' && Array.isArray(layer.children)) {
+    if (isContainerLayer(layer)) {
       indexLayerArtboards(layer.children, artboardId, target)
     }
   }
@@ -1478,8 +2108,9 @@ function normalizeComment(raw, index, nowIso, usedCommentIds, layerArtboard) {
 /**
  * Repair and bound a raw parsed board file into a valid document. Never throws: worst case it
  * returns an empty valid document. Unknown properties are dropped, missing ids are filled with
- * deterministic ids, invalid numbers fall back to defaults, nested frame structures are capped,
- * invalid layouts become `null`, and comments that point at missing layers are dropped.
+ * deterministic ids, invalid numbers fall back to defaults, nested frame/group structures are
+ * capped (including groups), invalid layouts become `null`, impossible min/max pairs are dropped,
+ * and comments that point at missing layers are dropped.
  *
  * @param {unknown} raw
  * @param {{ maxLayersPerArtboard?: number, maxArtboards?: number, nowIso?: string }} [opts]
@@ -1548,6 +2179,8 @@ function layoutSummaryParts(layout) {
   const parts = []
   parts.push(`layout=${LAYOUT_DIRECTIONS.includes(layout.direction) ? layout.direction : 'row'}`)
   parts.push(`gap=${fmt(numberOr(layout.gap, 0))}`)
+  if (isFiniteNumber(layout.rowGap)) parts.push(`rgap=${fmt(layout.rowGap)}`)
+  if (isFiniteNumber(layout.columnGap)) parts.push(`cgap=${fmt(layout.columnGap)}`)
   const padding = isObject(layout.padding) ? layout.padding : {}
   const top = fmt(numberOr(padding.top, 0))
   const right = fmt(numberOr(padding.right, 0))
@@ -1560,6 +2193,9 @@ function layoutSummaryParts(layout) {
   )
   parts.push(`align=${LAYOUT_ALIGNS.includes(layout.align) ? layout.align : 'stretch'}`)
   parts.push(`justify=${LAYOUT_JUSTIFIES.includes(layout.justify) ? layout.justify : 'start'}`)
+  if (typeof layout.alignContent === 'string' && layout.alignContent !== 'stretch') {
+    parts.push(`ac=${layout.alignContent}`)
+  }
   if (layout.wrap === true) parts.push('wrap')
   return parts
 }
@@ -1576,6 +2212,8 @@ function layerSummaryLine(layer, depth, commentCount) {
     if (typeof layer.fill === 'string') extras.push(`fill=${short(layer.fill, 32)}`)
     if (isFiniteNumber(layer.radius) && layer.radius > 0) extras.push(`radius=${fmt(layer.radius)}`)
     if (layer.clip === true) extras.push('clip')
+  } else if (layer.type === 'group') {
+    if (layer.clip === true) extras.push('clip')
   } else if (layer.type === 'text') {
     if (typeof layer.text === 'string' && layer.text) extras.push(`text=${JSON.stringify(short(layer.text, 80))}`)
     if (isFiniteNumber(layer.fontSize)) extras.push(`font=${fmt(layer.fontSize)}/${fmt(layer.fontWeight)}`)
@@ -1588,6 +2226,15 @@ function layerSummaryLine(layer, depth, commentCount) {
   } else if (layer.type === 'image') {
     if (typeof layer.src === 'string' && layer.src) extras.push(`src=${short(layer.src, 60)}`)
     if (typeof layer.fit === 'string') extras.push(`fit=${layer.fit}`)
+  } else if (layer.type === 'line') {
+    if (typeof layer.stroke === 'string') extras.push(`stroke=${short(layer.stroke, 32)}`)
+    if (isFiniteNumber(layer.strokeWidth)) extras.push(`sw=${fmt(layer.strokeWidth)}`)
+    if (typeof layer.orientation === 'string' && layer.orientation !== 'horizontal') {
+      extras.push(layer.orientation)
+    }
+    if (layer.dashed === true) extras.push('dashed')
+    if (layer.arrowStart === true) extras.push('arrowStart')
+    if (layer.arrowEnd === true) extras.push('arrowEnd')
   } else if (typeof layer.fill === 'string') {
     extras.push(`fill=${short(layer.fill, 32)}`)
     if (isFiniteNumber(layer.radius) && layer.radius > 0) extras.push(`radius=${fmt(layer.radius)}`)
@@ -1595,6 +2242,15 @@ function layerSummaryLine(layer, depth, commentCount) {
   if (isFiniteNumber(layer.opacity) && layer.opacity !== 1) extras.push(`opacity=${fmt(layer.opacity)}`)
   if (layer.grow === true) extras.push('grow')
   if (typeof layer.alignSelf === 'string') extras.push(`alignSelf=${layer.alignSelf}`)
+  if (layer.locked === true) extras.push('locked')
+  const hug = []
+  if (layer.hugWidth === true) hug.push('w')
+  if (layer.hugHeight === true) hug.push('h')
+  if (hug.length) extras.push(`hug=${hug.join('')}`)
+  if (isFiniteNumber(layer.minWidth)) extras.push(`minW=${fmt(layer.minWidth)}`)
+  if (isFiniteNumber(layer.minHeight)) extras.push(`minH=${fmt(layer.minHeight)}`)
+  if (isFiniteNumber(layer.maxWidth)) extras.push(`maxW=${fmt(layer.maxWidth)}`)
+  if (isFiniteNumber(layer.maxHeight)) extras.push(`maxH=${fmt(layer.maxHeight)}`)
   if (typeof layer.shadow === 'string' && layer.shadow) extras.push('shadow')
   if (layer.visible === false) extras.push('hidden')
   if (commentCount) extras.push(`${commentCount} comment${plural(commentCount)}`)
@@ -1602,14 +2258,26 @@ function layerSummaryLine(layer, depth, commentCount) {
   return parts.join(' ')
 }
 
-/** Total number of layers in a layer array, following nested frame children. */
+/** Total number of layers in a layer array, following nested container children. */
 function countLayerTree(layers) {
   let total = 0
   if (!Array.isArray(layers)) return total
   for (const layer of layers) {
     if (!isObject(layer)) continue
     total += 1
-    if (layer.type === 'frame') total += countLayerTree(layer.children)
+    if (isContainerLayer(layer)) total += countLayerTree(layer.children)
+  }
+  return total
+}
+
+/** Total number of layers of one type in a tree (used for the group count). */
+function countLayersOfType(layers, type) {
+  let total = 0
+  if (!Array.isArray(layers)) return total
+  for (const layer of layers) {
+    if (!isObject(layer)) continue
+    if (layer.type === type) total += 1
+    if (isContainerLayer(layer)) total += countLayersOfType(layer.children, type)
   }
   return total
 }
@@ -1621,7 +2289,7 @@ function sumLayerCommentTree(layers, counts) {
   for (const layer of layers) {
     if (!isObject(layer)) continue
     total += counts.get(layer.id) ?? 0
-    if (layer.type === 'frame') total += sumLayerCommentTree(layer.children, counts)
+    if (isContainerLayer(layer)) total += sumLayerCommentTree(layer.children, counts)
   }
   return total
 }
@@ -1633,7 +2301,7 @@ function pushLayerSummary(lines, layer, depth, commentCounts, state) {
     return
   }
   lines.push(layerSummaryLine(layer, depth, commentCounts.get(layer.id) ?? 0))
-  if (layer.type !== 'frame' || !Array.isArray(layer.children)) return
+  if (!isContainerLayer(layer)) return
   // Valid documents cannot nest below MAX_FRAME_DEPTH; the guard keeps a hand-edited file from
   // blowing the line budget through an unbounded walk.
   if (depth >= MAX_FRAME_DEPTH) return
@@ -1667,14 +2335,17 @@ export function summarizeDoc(doc) {
   }
 
   let layerTotal = 0
+  let groupTotal = 0
   for (const artboard of artboards) {
-    layerTotal += countLayerTree(Array.isArray(artboard.layers) ? artboard.layers : [])
+    const layers = Array.isArray(artboard.layers) ? artboard.layers : []
+    layerTotal += countLayerTree(layers)
+    groupTotal += countLayersOfType(layers, 'group')
   }
   const openComments = comments.filter((comment) => comment.status !== 'resolved')
   const name = typeof doc.name === 'string' && doc.name ? doc.name : 'Untitled design'
 
   const lines = [
-    `"${name}" - ${artboards.length} artboard${plural(artboards.length)}, ${layerTotal} layer${plural(layerTotal)}, ${comments.length} comment${plural(comments.length)} (${openComments.length} open)`,
+    `"${name}" - ${artboards.length} artboard${plural(artboards.length)}, ${layerTotal} layer${plural(layerTotal)}${groupTotal ? ` (${groupTotal} group${plural(groupTotal)})` : ''}, ${comments.length} comment${plural(comments.length)} (${openComments.length} open)`,
   ]
   const state = { truncated: false }
   for (const artboard of artboards) {

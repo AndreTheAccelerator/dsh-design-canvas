@@ -12,6 +12,8 @@
 
 const PREFIX = '/design-canvas'
 const MAX_BODY_BYTES = 1024 * 1024
+/** Reported by GET /design-canvas/health; keep in sync with package.json. */
+const VERSION = '2.0.0'
 
 /** Image-beacon diagnostics: the canvas page reports stages with <img> GETs. */
 const pings = []
@@ -103,7 +105,7 @@ export function registerDesignRoutes(ctx, store) {
       try {
         if (method === 'GET' || method === 'HEAD') {
           if (sub === '/health') {
-            send(res, 200, { ok: true, name: 'design-canvas', version: '1.0.0' }, method)
+            send(res, 200, { ok: true, name: 'design-canvas', version: VERSION }, method)
             return
           }
           if (sub === '/ping') {

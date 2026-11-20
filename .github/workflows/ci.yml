@@ -24,3 +24,5 @@ jobs:
           for file in host/*.js client.js; do node --check "$file"; done
       - name: Model tests
         run: node --test tests/model.test.mjs
+      - name: Client bundle tests
+        run: node --test tests/client.test.mjs

@@ -61,11 +61,12 @@ const APPLY_PARAMETERS = {
 
 const READ_DESCRIPTION =
   'Read the design canvas document for the current session before changing it: artboards, their ' +
-  'layers (nested inside `frame` layers) and element comments, plus the board path, version and ' +
-  'canvas UI state. Geometry is in px, colors are CSS strings, and a layer\'s position in its ' +
-  'parent\'s array (an artboard\'s `layers` or a frame\'s `children`) is its z-order (later paints ' +
-  'on top). Use `include:"summary"` for a compact indented text outline (frames show their ' +
-  '`layout=...` extras) instead of the full JSON document.'
+  'layers (nested inside `frame` / `group` layers) and element comments, plus the board path, ' +
+  'version and canvas UI state. Geometry is in px, colors are CSS strings, and a layer\'s position ' +
+  'in its parent\'s array (an artboard\'s `layers` or a container\'s `children`) is its z-order ' +
+  '(later paints on top). Use `include:"summary"` for a compact indented text outline (frames ' +
+  'show their `layout=...` extras, layers show `locked` / `hug=` / min-max markers) instead of ' +
+  'the full JSON document.'
 
 const APPLY_DESCRIPTION = [
   'Apply visual operations to the design canvas (the right-sidebar board the user also edits). ' +
@@ -73,29 +74,41 @@ const APPLY_DESCRIPTION = [
     'Geometry is in px, colors are CSS strings, and a layer\'s z-order is its array position ' +
     '(later = front). Op errors are reported in `errors` and do not fail the other ops unless ' +
     'atomic:true. Ops:',
-  '- artboard.add {artboard:{name?,width?,height?,background?,x?,y?}, index?}; artboard.update {artboardId, patch:{name?,width?,height?,background?,x?,y?}}; artboard.delete {artboardId}',
-  '- layer.add {artboardId?|parentId?, layer:{type, name?, x?, y?, width?, height?, ...props}, index?}; layer.update {layerId, patch:{...props}}; layer.delete {layerId}',
-  '- layer.reorder {layerId, index}; layer.move_to {layerId, artboardId?|parentId?, index?}',
-  '- comment.add {artboardId?, layerId?, text}; comment.update {commentId, status:"open"|"resolved"}; comment.delete {commentId}',
-  'Layer props. All layers: name, x, y, width, height, opacity (0..1), visible, grow, alignSelf, shadow (CSS box-shadow string, max 200 chars). ' +
+  '- board.update {patch:{name}}; artboard.add {artboard:{name?,width?,height?,background?,x?,y?}, index?}; artboard.update {artboardId, patch}; artboard.delete {artboardId}; artboard.duplicate {artboardId, name?, offsetX?, offsetY?}',
+  '- layer.add {artboardId?|parentId?, layer:{type, name?, x?, y?, width?, height?, ...props}, index?}; layer.update {layerId, patch:{...props}}; layer.delete {layerId} (subtree + comments)',
+  '- layer.reorder {layerId, index}; layer.move_to {layerId, artboardId?|parentId?, index?}; layer.duplicate {layerId, offsetX?, offsetY?, artboardId?|parentId?, index?}',
+  '- layer.group {layerIds, name?, artboardId?} (siblings only, absolute union box); layer.ungroup {layerId} (a group only)',
+  '- comment.add {artboardId?, layerId?, text}; comment.update {commentId, status:"open"|"resolved"}; comment.batch_update {commentIds, status}; comment.delete {commentId}',
+  'Layer types and props. All layers: name, x, y, width, height, opacity (0..1), visible, grow, alignSelf, shadow (CSS box-shadow string, max 200 chars), locked, minWidth/minHeight/maxWidth/maxHeight (px >= 0), hugWidth/hugHeight. ' +
     'rect: fill, radius, borderWidth, borderColor. ellipse: fill, borderWidth, borderColor. ' +
     'text: text, color, fontSize, fontWeight (400|500|600|700), fontFamily, align (left|center|right), lineHeight (px), fill (background), letterSpacing (-20..40 px), textTransform (none|uppercase|lowercase). ' +
     'image: src (http(s) or data: URL), fit (cover|contain|fill), radius. ' +
+    'line: a straight stroke inside its box — stroke (CSS color), strokeWidth (0.5..64), orientation (horizontal|vertical|diagonal), dashed, arrowStart, arrowEnd; no fill/radius/border/children. ' +
     'frame: fill, radius, borderWidth, borderColor, clip (bool), layout (object or null). ' +
+    'group: children + clip + opacity/visible/shadow, always absolute (no layout, no fill/border). ' +
     'width/height are >= 1; unknown ids, properties and enum values are rejected.',
-  'Styling: `shadow` is a CSS box-shadow string on any layer (null or "" clears it); fill and artboard background accept any CSS color or gradient string such as "linear-gradient(135deg,#2563eb,#1d4ed8)" or "radial-gradient(circle,#fff,#e5e7eb)" (text color and borderColor are plain colors only); text also accepts letterSpacing (-20..40 px) and textTransform (none|uppercase|lowercase).',
-  'Frames and auto layout. Pass exactly one of `artboardId` (top level) or `parentId` (a frame ' +
-    'id) to layer.add/layer.move_to; parentId derives the artboard. Frames nest up to 5 levels ' +
-    '(top-level layers are depth 1) and hold up to 200 children; ids stay globally unique. ' +
-    '`layout:null` (a frame\'s default) means children use absolute x/y relative to the frame. A ' +
-    'layout object is {direction:"row"|"column", gap >= 0, padding:{top,right,bottom,left} each >= 0, ' +
-    'align:"start"|"center"|"end"|"stretch" (cross axis), justify:"start"|"center"|"end"|"space-between" ' +
-    '(main axis), wrap:bool}; missing fields default to row / gap 0 / padding 0 / stretch / start / false. ' +
+  'Styling: `shadow` is a CSS box-shadow string on any layer (null or "" clears it); fill and artboard background accept any CSS color or gradient string such as "linear-gradient(135deg,#2563eb,#1d4ed8)" or "radial-gradient(circle,#fff,#e5e7eb)" (text color, borderColor and line stroke are plain colors only); text also accepts letterSpacing (-20..40 px) and textTransform (none|uppercase|lowercase). Optional hints clear instead of storing a default: shadow:null, locked:false, hugWidth:false, maxWidth:null.',
+  'Frames, groups and auto layout. Pass exactly one of `artboardId` (top level) or `parentId` (a ' +
+    'frame/group id) to layer.add/layer.move_to/layer.duplicate; parentId derives the artboard. ' +
+    'Containers nest up to 5 levels (top-level layers are depth 1) and hold up to 200 children; ' +
+    'ids stay globally unique. `layout:null` (a frame\'s default) means children use absolute ' +
+    'x/y relative to the frame; a `group` is always absolute. A layout object is ' +
+    '{direction:"row"|"column", gap >= 0, rowGap? >= 0, columnGap? >= 0 (fall back to gap), ' +
+    'padding:{top,right,bottom,left} each >= 0, align:"start"|"center"|"end"|"stretch" (cross axis), ' +
+    'alignContent:"start"|"center"|"end"|"stretch"|"space-between"|"space-around" (wrapped runs), ' +
+    'justify:"start"|"center"|"end"|"space-between"|"space-around"|"space-evenly" (main axis), ' +
+    'wrap:bool}; missing fields default to row / gap 0 / padding 0 / stretch / stretch / start / false. ' +
     'Inside an auto-layout frame the renderer computes each child\'s x/y from the layout, so authored ' +
     'child x/y are ignored: set width/height and the optional child props grow:true (fill free ' +
     'main-axis space) and alignSelf:"start"|"center"|"end"|"stretch"|null. Children are created, moved ' +
-    'and deleted with layer ops (`children` is not patchable); deleting a frame deletes its subtree ' +
-    'and every comment on it.',
+    'and deleted with layer ops (`children` is not patchable); deleting a container deletes its ' +
+    'subtree and every comment on it. Layers in one auto-layout frame cannot be grouped.',
+  'Grouping and duplication. `layer.group` needs siblings that share one parent (not an auto-layout ' +
+    'frame); it wraps them in a new `group` at the union of their boxes, keeps their z-order and ' +
+    'rewrites their x/y relative to the group, so absolute grouping is not a layout change. ' +
+    '`layer.ungroup` promotes a group\'s children to its parent, adding the group offset back. ' +
+    '`layer.duplicate` deep-copies a subtree with fresh ids and offsets the root by 16/16 by ' +
+    'default; `artboard.duplicate` copies a whole board 80/80 to the right. Comments are never copied.',
   'Example (one row frame + two cards in a single design_apply call; caller-supplied ids make the ' +
     'parentId references resolvable in the same call): ops:[{type:"layer.add", artboardId:"ab-landing", ' +
     'layer:{id:"l-row", type:"frame", name:"Feature row", x:96, y:420, width:1008, height:180, ' +
@@ -109,7 +122,7 @@ const PROMPT_TEXT = [
   'The user has a Design canvas: a right-sidebar board paired with this chat, which the user also edits directly by dragging, resizing, typing, and leaving element comments.',
   'When a request concerns the canvas, call design_read first (include:"summary" gives a compact outline) and then express changes as visual operations through design_apply, using geometry in px, colors as CSS strings, and array position as z-order.',
   'Use only ids that design_read returned, never guess them, and read the `errors` array to correct a rejected op instead of retrying the whole call.',
-  'For layout work prefer `frame` layers with a CSS-like `layout` (row/column, gap, padding, align/justify, wrap) and nest children with layer.add `parentId` instead of hand-placing them: inside an auto-layout frame the renderer computes child x/y from the layout, so set sizes (and optional grow/alignSelf), not coordinates.',
+  'For layout work prefer `frame` layers with a CSS-like `layout` (row/column, gap/rowGap/columnGap, padding, align/alignContent/justify, wrap) and nest children with layer.add `parentId` instead of hand-placing them: inside an auto-layout frame the renderer computes child x/y from the layout, so set sizes (and optional grow/alignSelf), not coordinates. Use `group` for plain visual grouping (it keeps absolute positions), `line` for dividers/connectors, and `layer.duplicate` / `layer.group` / `layer.ungroup` instead of rebuilding a subtree by hand.',
   'A user message that starts with "Design canvas revision request" is an element comment the user left on the board: act on it immediately and turn it into ops. The message already carries the board id, artboard size, target layer id, its geometry and its current props, so skip design_read when that is enough, design_apply the minimal styling/geometry ops (layer.update first, layer.add only when the comment asks for something new), keep unrelated layers untouched, then design_apply comment.update with the given commentId and status "resolved".',
   'For those revision requests do not ask clarifying questions and do not deliberate over visual taste: pick a reasonable interpretation that satisfies the comment and reply with one short sentence about what changed.',
   'Never hand-edit the design-board JSON file: the Host store owns it, and outside edits bypass the canvas.',
@@ -119,13 +132,13 @@ function textBlock(text) {
   return [{ type: 'text', text: typeof text === 'string' ? text : String(text) }]
 }
 
-/** Collect every layer id in a tree (artboard top level + nested frame children). */
+/** Collect every layer id in a tree (artboard top level + nested frame/group children). */
 function collectLayerIds(layers, target) {
   if (!Array.isArray(layers)) return
   for (const layer of layers) {
     if (!layer || typeof layer !== 'object') continue
     if (typeof layer.id === 'string') target.add(layer.id)
-    if (layer.type === 'frame') collectLayerIds(layer.children, target)
+    if (Array.isArray(layer.children)) collectLayerIds(layer.children, target)
   }
 }
 

@@ -13,10 +13,13 @@
  * cross-part references unless the referenced part comes earlier in MANIFEST.
  *
  * Usage:
- *   node scripts/build-client.mjs            write client.js
- *   node scripts/build-client.mjs --check    verify client.js matches the parts
+ *   node scripts/build-client.mjs                     write client.js
+ *   node scripts/build-client.mjs --check             verify client.js matches the parts
+ *   node scripts/build-client.mjs --out <path>        write the bundle somewhere else (a
+ *                                                     scratch file for `node --check` while
+ *                                                     several authors edit parts in parallel)
  */
-import { readFile, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 
@@ -79,6 +82,8 @@ async function assemble() {
 
 async function main() {
   const check = process.argv.includes('--check')
+  const outIndex = process.argv.indexOf('--out')
+  const outPath = outIndex >= 0 ? process.argv[outIndex + 1] : ''
   const source = await assemble()
 
   if (check) {
@@ -97,6 +102,14 @@ async function main() {
       return
     }
     console.log(`client.js is up to date (${MANIFEST.length} parts, ${source.length} bytes)`)
+    return
+  }
+
+  if (outPath) {
+    const target = path.resolve(ROOT, outPath)
+    await mkdir(path.dirname(target), { recursive: true })
+    await writeFile(target, source, 'utf8')
+    console.log(`wrote ${target} from ${MANIFEST.length} parts (${source.length} bytes)`)
     return
   }
 

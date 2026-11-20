@@ -4,3 +4,4 @@ node_modules/
 Thumbs.db
 .scratch/
 design-board.json
+dev/vendor/

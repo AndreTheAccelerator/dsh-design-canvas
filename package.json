@@ -1,8 +1,8 @@
 {
   "name": "@andretaccelerator/dsh-design-canvas",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
-  "description": "Chat-paired design canvas for the DeepSeek Harness Web UI: artboard layers, CSS-like auto-layout frames, inline element comments, and agent-revisable direct manipulation",
+  "description": "Chat-paired design canvas for the DeepSeek Harness Web UI: artboards, multi-select, groups, lines, CSS-like auto-layout, inline element comments (single or batch), agent-revisable ops, and export to code/SVG/PNG",
   "license": "MIT",
   "type": "module",
   "keywords": [
@@ -13,14 +13,17 @@
     "ai-agent",
     "figma-like",
     "artboard",
-    "flexbox"
+    "flexbox",
+    "auto-layout",
+    "export-to-code",
+    "svg"
   ],
   "scripts": {
     "build": "node scripts/build-client.mjs",
     "build:check": "node scripts/build-client.mjs --check",
     "dev": "node dev/serve.mjs",
-    "test": "node --test tests/model.test.mjs",
-    "check": "npm run build:check && node --check index.js && node --check client.js && node --test tests/model.test.mjs"
+    "test": "node --test tests/model.test.mjs tests/client.test.mjs",
+    "check": "npm run build:check && node --check index.js && node --check client.js && node --test tests/model.test.mjs tests/client.test.mjs"
   },
   "exports": {
     ".": "./index.js",

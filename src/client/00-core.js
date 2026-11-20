@@ -157,6 +157,8 @@ window.__ModuleLoader__.load({
       sessions: null,
       sidebarRight: null,
       locale: null,
+      /** Design (project) name of the last document seen, used for the tab title. */
+      designName: '',
     }
 
     function servicesSnapshot() {

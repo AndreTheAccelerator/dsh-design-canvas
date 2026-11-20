@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Design canvas",
-    "description": "A chat-paired design canvas: artboards with editable layers, inline element comments, and drag/resize editing the agent can revise."
+    "description": "A chat-paired design canvas: artboards with editable layers and auto-layout, multi-select, groups, lines, inline element comments (one or many at a time), and export to code, SVG or PNG — all revisable by the agent."
   }
 }

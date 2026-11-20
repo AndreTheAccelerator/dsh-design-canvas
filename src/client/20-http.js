@@ -28,6 +28,12 @@
           failure.code = detail && detail.code ? detail.code : 'http-' + response.status
           throw failure
         }
+        // Track the design (project) name so the sidebar tab can show it. Every mutation
+        // response carries the document, so a rename is picked up on the next request.
+        if (body && body.doc && typeof body.doc.name === 'string') {
+          const name = body.doc.name.trim().slice(0, 120)
+          if (name) runtime.designName = name
+        }
         return body
       })
     }
