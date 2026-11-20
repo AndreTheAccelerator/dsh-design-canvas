@@ -6086,15 +6086,6 @@ window.__ModuleLoader__.load({
       return 'dcm-item-' + key.replace(/[^a-zA-Z0-9_-]/g, '-') + '-' + String(index)
     }
 
-    function contextMenuFirstEnabledIndex(items) {
-      const list = Array.isArray(items) ? items : []
-      for (let index = 0; index < list.length; index += 1) {
-        const item = list[index]
-        if (item && !item.separator && !item.disabled) return index
-      }
-      return -1
-    }
-
     /* ------------------------------------------------------------------------------------------
      * DOM plumbing: app root, target resolution, focus helpers
      * ---------------------------------------------------------------------------------------- */
@@ -6842,17 +6833,6 @@ window.__ModuleLoader__.load({
           },
         }),
       ]
-      if (info.rawLayerId && info.rawLayerId !== info.layerId) {
-        // The element under the pointer belongs to a group: say which unit the menu acts on.
-        items.push(contextMenuSeparator('sep-group-note'))
-        items.push(
-          contextMenuItem('select-child', 'Right-click again to pick the child', {
-            icon: 'search',
-            disabled: true,
-            reason: 'Drill into the group (Enter) to target its children',
-          }),
-        )
-      }
       const label = multi
         ? String(ids.length) + ' ' + CONTEXT_MENU_COPY.layers + ' ' + CONTEXT_MENU_COPY.selected
         : contextMenuTypeLabel(layer ? layer.type : primaryNode ? primaryNode.type : 'layer') +
@@ -7218,7 +7198,7 @@ window.__ModuleLoader__.load({
       /** Resolve the target, apply click-selection semantics and open the menu at the pointer. */
       const openMenu = React.useCallback(function (currentCtx, info, event) {
         const editor = (currentCtx && currentCtx.editor) || {}
-        const selectedIds = Array.isArray(editor.selectedLayerIds) ? editor.selectedLayerIds.slice() : []
+        const selectedIds = contextMenuLiveSelectionIds(currentCtx)
         let selectionIds = selectedIds
         if (info.kind === 'layer') {
           if (selectedIds.indexOf(info.layerId) < 0) {
