@@ -215,7 +215,13 @@
         [ui.scope, ui.scale, ui.includeComments, activeArtboard, selection.layerIds],
       )
 
-      const fileInfo = exportFileInfo(ui.format || 'html', activeArtboard, doc)
+      const fileInfo = exportFileInfo(
+        ui.format || 'html',
+        ui.scope === 'selection'
+          ? { name: 'selection', width: 0, height: 0 }
+          : activeArtboard,
+        doc,
+      )
       const fileName = ui.fileName || fileInfo.fileName
 
       // Regenerate the preview whenever the inputs change.
@@ -594,6 +600,92 @@
         return true
       },
     })
+
+    /**
+     * Copy the current selection to the clipboard as `format` ('svg' | 'png' | 'html' | 'react' |
+     * 'json'). Used by the context menu's "Copy as …" items; falls back to a readable error when
+     * the clipboard is unavailable.
+     */
+    function copySelectionAs(format, api) {
+      const ctx = api || {}
+      const editor = ctx.editor || ctx
+      const doc = ctx.doc || (editor && editor.doc) || null
+      const selection = ctx.selection || (editor && editor.selection) || null
+      const layerIds = selection && Array.isArray(selection.layerIds) ? selection.layerIds : []
+      const setError =
+        typeof ctx.setInlineError === 'function'
+          ? ctx.setInlineError
+          : editor && typeof editor.setInlineError === 'function'
+            ? editor.setInlineError
+            : function () {}
+      if (!doc || !layerIds.length) {
+        setError('Select something to copy first')
+        return Promise.resolve(false)
+      }
+      const options = { scope: 'selection', layerIds: layerIds, scale: 2 }
+      const label = layerIds.length === 1 ? 'layer' : layerIds.length + ' layers'
+      try {
+        if (format === 'png') {
+          return Promise.resolve(renderPngDataUrl(doc, options)).then(
+            function (dataUrl) {
+              return copyImageDataUrl(dataUrl).then(function (ok) {
+                setError(ok ? 'Copied ' + label + ' as PNG' : 'Could not copy the PNG')
+                return ok
+              })
+            },
+            function (error) {
+              setError(messageOf(error))
+              return false
+            },
+          )
+        }
+        const text = renderExport(doc, format, options)
+        return copyTextToClipboard(text).then(function (ok) {
+          setError(
+            ok
+              ? 'Copied ' + label + ' as ' + String(format).toUpperCase()
+              : 'Could not copy to the clipboard',
+          )
+          return ok
+        })
+      } catch (error) {
+        setError(messageOf(error))
+        return Promise.resolve(false)
+      }
+    }
+
+    /** Copy a PNG data URL as an image (ClipboardItem), falling back to a download. */
+    function copyImageDataUrl(dataUrl) {
+      try {
+        if (
+          typeof navigator !== 'undefined' &&
+          navigator.clipboard &&
+          typeof navigator.clipboard.write === 'function' &&
+          typeof ClipboardItem === 'function'
+        ) {
+          return fetch(dataUrl)
+            .then(function (response) {
+              return response.blob()
+            })
+            .then(function (blob) {
+              return navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })])
+            })
+            .then(
+              function () {
+                return true
+              },
+              function () {
+                downloadDataUrl('selection.png', dataUrl)
+                return true
+              },
+            )
+        }
+      } catch (error) {
+        /* fall through to the download */
+      }
+      downloadDataUrl('selection.png', dataUrl)
+      return Promise.resolve(true)
+    }
 
     registerCommand({
       id: 'export-dialog',

@@ -166,8 +166,34 @@
 .dc-layer-auto { cursor: grab; }
 .dc-comment-mode .dc-layer { cursor: crosshair; }
 .dc-gesture-active .dc-layer { cursor: default; }
-.dc-sel-box { position: absolute; z-index: 20; box-sizing: border-box; border: 1px solid var(--dsw-alias-brand-primary, #3b82f6); pointer-events: none; }
-.dc-sel-handle { position: absolute; z-index: 21; width: 8px; height: 8px; box-sizing: border-box; background: var(--dsw-alias-bg-base, #ffffff); border: 1px solid var(--dsw-alias-brand-primary, #3b82f6); border-radius: 2px; pointer-events: auto; }
+/* ================================================================== SELECTION CHROME ========
+ * Owned by the selection overlay renderer (src/client/60-render.js): the union selection box,
+ * its 8 resize handles and the thin per-member outlines. Everything here is *screen* constant
+ * by construction — the stage carries CSS zoom and the renderer divides every dimension by
+ * it (borderWidth, handle size, radius, shadow) — so these rules must never scale anything
+ * themselves and must not set width/height/border-width (the renderer writes those inline).
+ *
+ * Colours: the DSH theme accent is monochrome, so the selection reads with a fixed Figma-style
+ * blue that has contrast on both light and dark artboards. The custom property
+ * --dsw-alias-accent-selection is honoured when a theme provides it.
+ * ========================================================================================== */
+.dc-sel-box,
+.dc-sel-member,
+.dc-sel-handle { --dc-selection-accent: var(--dsw-alias-accent-selection, #0d99ff); }
+.dc-sel-member { position: absolute; z-index: 19; box-sizing: border-box; border: 1px solid var(--dc-selection-accent); pointer-events: none; }
+.dc-sel-box { position: absolute; z-index: 20; box-sizing: border-box; border: 1px solid var(--dc-selection-accent); pointer-events: none; }
+.dc-sel-handle { position: absolute; z-index: 21; box-sizing: border-box; background: #ffffff; border: 1.5px solid var(--dc-selection-accent); border-radius: 2px; box-shadow: 0 0 0 0.5px rgba(13, 153, 255, 0.9), 0 0 0 1px rgba(13, 153, 255, 0.16), 0 1px 2px rgba(15, 23, 42, 0.26); pointer-events: auto; }
+/* Fill only: the renderer writes the screen-constant box-shadow inline (it has to divide it by
+ * the zoom), so a stylesheet shadow here would never win, and animating it would also flicker
+ * on every zoom step. */
+@media (hover: hover) {
+  .dc-sel-handle:hover { background: var(--dc-selection-accent); }
+}
+.dc-sel-handle:active { background: var(--dc-selection-accent); }
+@media (prefers-reduced-motion: no-preference) {
+  .dc-sel-handle { transition: background-color 90ms ease-out; }
+}
+
 .dc-pin { position: absolute; z-index: 25; min-width: 18px; height: 18px; padding: 0 4px; border-radius: 9px; border: 1px solid var(--dsw-alias-bg-base, #ffffff); background: var(--dsw-alias-brand-primary, #3b82f6); color: var(--dsw-alias-bg-base, #ffffff); font-size: 10px; font-weight: 700; line-height: 1; display: inline-flex; align-items: center; justify-content: center; cursor: pointer; }
 
 /* ------------------------------------------------------------------ composer */

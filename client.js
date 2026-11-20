@@ -3264,8 +3264,34 @@ window.__ModuleLoader__.load({
 .dc-layer-auto { cursor: grab; }
 .dc-comment-mode .dc-layer { cursor: crosshair; }
 .dc-gesture-active .dc-layer { cursor: default; }
-.dc-sel-box { position: absolute; z-index: 20; box-sizing: border-box; border: 1px solid var(--dsw-alias-brand-primary, #3b82f6); pointer-events: none; }
-.dc-sel-handle { position: absolute; z-index: 21; width: 8px; height: 8px; box-sizing: border-box; background: var(--dsw-alias-bg-base, #ffffff); border: 1px solid var(--dsw-alias-brand-primary, #3b82f6); border-radius: 2px; pointer-events: auto; }
+/* ================================================================== SELECTION CHROME ========
+ * Owned by the selection overlay renderer (src/client/60-render.js): the union selection box,
+ * its 8 resize handles and the thin per-member outlines. Everything here is *screen* constant
+ * by construction — the stage carries CSS zoom and the renderer divides every dimension by
+ * it (borderWidth, handle size, radius, shadow) — so these rules must never scale anything
+ * themselves and must not set width/height/border-width (the renderer writes those inline).
+ *
+ * Colours: the DSH theme accent is monochrome, so the selection reads with a fixed Figma-style
+ * blue that has contrast on both light and dark artboards. The custom property
+ * --dsw-alias-accent-selection is honoured when a theme provides it.
+ * ========================================================================================== */
+.dc-sel-box,
+.dc-sel-member,
+.dc-sel-handle { --dc-selection-accent: var(--dsw-alias-accent-selection, #0d99ff); }
+.dc-sel-member { position: absolute; z-index: 19; box-sizing: border-box; border: 1px solid var(--dc-selection-accent); pointer-events: none; }
+.dc-sel-box { position: absolute; z-index: 20; box-sizing: border-box; border: 1px solid var(--dc-selection-accent); pointer-events: none; }
+.dc-sel-handle { position: absolute; z-index: 21; box-sizing: border-box; background: #ffffff; border: 1.5px solid var(--dc-selection-accent); border-radius: 2px; box-shadow: 0 0 0 0.5px rgba(13, 153, 255, 0.9), 0 0 0 1px rgba(13, 153, 255, 0.16), 0 1px 2px rgba(15, 23, 42, 0.26); pointer-events: auto; }
+/* Fill only: the renderer writes the screen-constant box-shadow inline (it has to divide it by
+ * the zoom), so a stylesheet shadow here would never win, and animating it would also flicker
+ * on every zoom step. */
+@media (hover: hover) {
+  .dc-sel-handle:hover { background: var(--dc-selection-accent); }
+}
+.dc-sel-handle:active { background: var(--dc-selection-accent); }
+@media (prefers-reduced-motion: no-preference) {
+  .dc-sel-handle { transition: background-color 90ms ease-out; }
+}
+
 .dc-pin { position: absolute; z-index: 25; min-width: 18px; height: 18px; padding: 0 4px; border-radius: 9px; border: 1px solid var(--dsw-alias-bg-base, #ffffff); background: var(--dsw-alias-brand-primary, #3b82f6); color: var(--dsw-alias-bg-base, #ffffff); font-size: 10px; font-weight: 700; line-height: 1; display: inline-flex; align-items: center; justify-content: center; cursor: pointer; }
 
 /* ------------------------------------------------------------------ composer */
@@ -3437,6 +3463,12 @@ window.__ModuleLoader__.load({
         artboard: artboard,
         scope: scope,
         layerIds: layerIds,
+        selectionName:
+          typeof input.selectionName === 'string' && input.selectionName
+            ? input.selectionName
+            : layerIds.length === 1
+              ? 'selection'
+              : 'selection-' + layerIds.length + '-layers',
         scale: scale,
         includeComments: input.includeComments === true,
         pretty: input.pretty !== false,
@@ -4351,6 +4383,11 @@ window.__ModuleLoader__.load({
     /** Rasterise the SVG export into a PNG data URL (browser only; rejects in Node). */
     function renderPngDataUrl(doc, options) {
       const resolved = resolveExportOptions(doc, options)
+      // A selection is rendered through its synthetic document (see exportTargetDoc).
+      const target = exportTargetDoc(doc, resolved)
+      if (target && target !== doc) {
+        return renderPngDataUrl(target, { scale: resolved.scale })
+      }
       const artboard = resolved.artboard
       const svg = renderSvg(doc, options)
       if (!artboard) return Promise.reject(new Error('no artboard to export'))
@@ -4500,20 +4537,148 @@ window.__ModuleLoader__.load({
       }
     }
 
+    /* --- selection export ------------------------------------------------------------------
+     * "Export objects, not only artboards": the selection is re-rooted into a synthetic
+     * one-artboard document whose size is the selection's bounding box, with every root moved to
+     * its absolute position. The existing renderers then run unchanged, so HTML/React/SVG/PNG/JSON
+     * all support a selection without a second code path.
+     * -------------------------------------------------------------------------------------- */
+
+    /** Outermost selected computed nodes (a selected container covers its descendants). */
+    function selectionExportRoots(doc, layerIds) {
+      const tree = buildComputedTree(doc)
+      const wanted = new Set(
+        (Array.isArray(layerIds) ? layerIds : []).filter(function (id) {
+          return typeof id === 'string' && id
+        }),
+      )
+      if (!wanted.size) return []
+      const roots = []
+      const visit = function (nodes) {
+        const list = Array.isArray(nodes) ? nodes : []
+        for (let index = 0; index < list.length; index += 1) {
+          const node = list[index]
+          if (!node || !node.layer) continue
+          if (wanted.has(node.id)) {
+            roots.push(node)
+            continue
+          }
+          if (Array.isArray(node.children) && node.children.length) visit(node.children)
+        }
+      }
+      const boards = Array.isArray(tree.artboards) ? tree.artboards : []
+      for (let index = 0; index < boards.length; index += 1) {
+        const entry = boards[index]
+        if (entry && Array.isArray(entry.layers)) visit(entry.layers)
+      }
+      return roots
+    }
+
+    /** Bounding box of computed nodes, in artboard-local canvas units. */
+    function nodesBoundingBox(nodes) {
+      let minX = Infinity
+      let minY = Infinity
+      let maxX = -Infinity
+      let maxY = -Infinity
+      const list = Array.isArray(nodes) ? nodes : []
+      for (let index = 0; index < list.length; index += 1) {
+        const rect = list[index] && list[index].worldRect
+        if (!rect) continue
+        minX = Math.min(minX, finiteNumber(rect.x, 0))
+        minY = Math.min(minY, finiteNumber(rect.y, 0))
+        maxX = Math.max(maxX, finiteNumber(rect.x, 0) + Math.max(0, finiteNumber(rect.width, 0)))
+        maxY = Math.max(maxY, finiteNumber(rect.y, 0) + Math.max(0, finiteNumber(rect.height, 0)))
+      }
+      if (!Number.isFinite(minX) || !Number.isFinite(minY)) return null
+      return {
+        x: minX,
+        y: minY,
+        width: Math.max(1, maxX - minX),
+        height: Math.max(1, maxY - minY),
+      }
+    }
+
+    /**
+     * A synthetic document holding just the selection. Roots become absolutely positioned at their
+     * rendered position (so a layer that lived inside an auto-layout frame lands where it looked),
+     * children keep their relative coordinates.
+     */
+    function selectionExportDoc(doc, layerIds, name) {
+      const roots = selectionExportRoots(doc, layerIds)
+      if (!roots.length) return null
+      const box = nodesBoundingBox(roots)
+      if (!box) return null
+      const layers = roots.map(function (node) {
+        const layer = node.layer
+        const rect = node.worldRect || { x: 0, y: 0, width: layer.width, height: layer.height }
+        const copy = cloneLayerProps(layer)
+        copy.x = roundTo(finiteNumber(rect.x, 0) - box.x, 2)
+        copy.y = roundTo(finiteNumber(rect.y, 0) - box.y, 2)
+        copy.width = Math.max(1, roundTo(finiteNumber(rect.width, finiteNumber(layer.width, 1)), 2))
+        copy.height = Math.max(1, roundTo(finiteNumber(rect.height, finiteNumber(layer.height, 1)), 2))
+        return copy
+      })
+      return {
+        schemaVersion: doc && doc.schemaVersion ? doc.schemaVersion : 1,
+        name: (doc && doc.name) || 'Design',
+        version: doc && typeof doc.version === 'number' ? doc.version : 1,
+        updatedAt: (doc && doc.updatedAt) || '1970-01-01T00:00:00.000Z',
+        artboards: [
+          {
+            id: 'ab-selection',
+            name: name || 'Selection',
+            x: 0,
+            y: 0,
+            width: Math.ceil(box.width),
+            height: Math.ceil(box.height),
+            background: 'transparent',
+            layers: layers,
+          },
+        ],
+        comments: [],
+      }
+    }
+
+    /** Deep copy of a layer's authored props (no computed fields, no shared arrays). */
+    function cloneLayerProps(layer) {
+      const copy = {}
+      const keys = Object.keys(layer || {})
+      for (let index = 0; index < keys.length; index += 1) {
+        const key = keys[index]
+        const value = layer[key]
+        if (Array.isArray(value)) copy[key] = value.slice()
+        else if (isObject(value)) copy[key] = JSON.parse(JSON.stringify(value))
+        else copy[key] = value
+      }
+      return copy
+    }
+
+    /** Resolve the document a format should render: the selection wrapped as a document, or doc. */
+    function exportTargetDoc(doc, resolved) {
+      if (!doc) return null
+      if (resolved && resolved.scope === 'selection' && resolved.layerIds && resolved.layerIds.length) {
+        return selectionExportDoc(doc, resolved.layerIds, resolved.selectionName) || doc
+      }
+      return doc
+    }
+
     /** Export the current document in one of EXPORT_FORMATS; returns a string (PNG: data URL). */
     function renderExport(doc, format, options) {
+      const resolved = resolveExportOptions(doc, options)
+      const target = exportTargetDoc(doc, resolved) || doc
+      const forwarded = resolved.scope === 'selection' ? { pretty: resolved.pretty } : options
       switch (format) {
         case 'json':
-          return renderJson(doc, options)
+          return renderJson(target, forwarded)
         case 'svg':
-          return renderSvg(doc, options)
+          return renderSvg(target, forwarded)
         case 'react':
-          return renderReact(doc, options)
+          return renderReact(target, forwarded)
         case 'png':
-          return renderPngDataUrl(doc, options)
+          return renderPngDataUrl(target, forwarded)
         case 'html':
         default:
-          return renderHtml(doc, options)
+          return renderHtml(target, forwarded)
       }
     }
 
@@ -4744,7 +4909,13 @@ window.__ModuleLoader__.load({
         [ui.scope, ui.scale, ui.includeComments, activeArtboard, selection.layerIds],
       )
 
-      const fileInfo = exportFileInfo(ui.format || 'html', activeArtboard, doc)
+      const fileInfo = exportFileInfo(
+        ui.format || 'html',
+        ui.scope === 'selection'
+          ? { name: 'selection', width: 0, height: 0 }
+          : activeArtboard,
+        doc,
+      )
       const fileName = ui.fileName || fileInfo.fileName
 
       // Regenerate the preview whenever the inputs change.
@@ -5123,6 +5294,92 @@ window.__ModuleLoader__.load({
         return true
       },
     })
+
+    /**
+     * Copy the current selection to the clipboard as `format` ('svg' | 'png' | 'html' | 'react' |
+     * 'json'). Used by the context menu's "Copy as …" items; falls back to a readable error when
+     * the clipboard is unavailable.
+     */
+    function copySelectionAs(format, api) {
+      const ctx = api || {}
+      const editor = ctx.editor || ctx
+      const doc = ctx.doc || (editor && editor.doc) || null
+      const selection = ctx.selection || (editor && editor.selection) || null
+      const layerIds = selection && Array.isArray(selection.layerIds) ? selection.layerIds : []
+      const setError =
+        typeof ctx.setInlineError === 'function'
+          ? ctx.setInlineError
+          : editor && typeof editor.setInlineError === 'function'
+            ? editor.setInlineError
+            : function () {}
+      if (!doc || !layerIds.length) {
+        setError('Select something to copy first')
+        return Promise.resolve(false)
+      }
+      const options = { scope: 'selection', layerIds: layerIds, scale: 2 }
+      const label = layerIds.length === 1 ? 'layer' : layerIds.length + ' layers'
+      try {
+        if (format === 'png') {
+          return Promise.resolve(renderPngDataUrl(doc, options)).then(
+            function (dataUrl) {
+              return copyImageDataUrl(dataUrl).then(function (ok) {
+                setError(ok ? 'Copied ' + label + ' as PNG' : 'Could not copy the PNG')
+                return ok
+              })
+            },
+            function (error) {
+              setError(messageOf(error))
+              return false
+            },
+          )
+        }
+        const text = renderExport(doc, format, options)
+        return copyTextToClipboard(text).then(function (ok) {
+          setError(
+            ok
+              ? 'Copied ' + label + ' as ' + String(format).toUpperCase()
+              : 'Could not copy to the clipboard',
+          )
+          return ok
+        })
+      } catch (error) {
+        setError(messageOf(error))
+        return Promise.resolve(false)
+      }
+    }
+
+    /** Copy a PNG data URL as an image (ClipboardItem), falling back to a download. */
+    function copyImageDataUrl(dataUrl) {
+      try {
+        if (
+          typeof navigator !== 'undefined' &&
+          navigator.clipboard &&
+          typeof navigator.clipboard.write === 'function' &&
+          typeof ClipboardItem === 'function'
+        ) {
+          return fetch(dataUrl)
+            .then(function (response) {
+              return response.blob()
+            })
+            .then(function (blob) {
+              return navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })])
+            })
+            .then(
+              function () {
+                return true
+              },
+              function () {
+                downloadDataUrl('selection.png', dataUrl)
+                return true
+              },
+            )
+        }
+      } catch (error) {
+        /* fall through to the download */
+      }
+      downloadDataUrl('selection.png', dataUrl)
+      return Promise.resolve(true)
+    }
 
     registerCommand({
       id: 'export-dialog',
@@ -5660,6 +5917,3303 @@ window.__ModuleLoader__.load({
      * Layer tree
      * ---------------------------------------------------------------------------------------- */
     /* ------------------------------------------------------------------------------------------
+     * Context menu (right-click)
+     *
+     * One menu for everything on the canvas: layers, artboards and the empty canvas. Items follow
+     * Figma's object menu (see the header of the menu builder for the list), grouped with
+     * separators and showing their keyboard shortcut on the right.
+     *
+     * Self-contained: it attaches one `contextmenu` listener on the app root, resolves the target
+     * from the DOM (`[data-layer-id]`, `[data-artboard-id]`, `.dc-canvas`) and renders through
+     * EXTENSIONS.appPanels, so no other part needs a mount point.
+     *
+     * This part owns no document state: every action funnels into the editor API
+     * (`ctx.editor`) and, when the editor does not expose a capability yet, the item is rendered
+     * DISABLED with the reason in its `title` instead of silently disappearing.
+     * ---------------------------------------------------------------------------------------- */
+
+    /* ------------------------------------------------------------------------------------------
+     * Copy + styles (feature copy; localized in the docs pass)
+     * ---------------------------------------------------------------------------------------- */
+
+    const CONTEXT_MENU_COPY = {
+      menuLabel: 'Canvas menu',
+      layerMenu: 'Object menu',
+      artboardMenu: 'Artboard menu',
+      canvasMenu: 'Canvas menu',
+      canvas: 'Canvas',
+      layer: 'Layer',
+      layers: 'layers',
+      selected: 'selected',
+      renameUnavailable: 'Rename from the Layers panel',
+      copyUnavailable: 'Selection copy is not available in this build — use Export selection…',
+      exportUnavailable: 'Export is provided by the export extension',
+      shortcutsUnavailable: 'Keyboard shortcuts are provided by the shortcuts extension',
+      commentModeHint: 'Comment mode: click an element to add a comment',
+      frameName: 'Frame',
+      frameEmpty: 'Select layers to frame',
+      framed: 'Framed the selection',
+      artboardDuplicated: 'Artboard duplicated',
+      copiedPng: 'Copied the selection as PNG',
+      copiedSvg: 'Copied the selection as SVG',
+      copiedArtboardPng: 'Copied the artboard as PNG',
+      copiedArtboardSvg: 'Copied the artboard as SVG',
+      copyFailed: 'Could not copy to the clipboard',
+      actionFailed: 'That action failed',
+      fitUnavailable: 'Fit to artboard needs the canvas layout',
+      noArtboards: 'Add an artboard first',
+      enterSelection: 'Enter selection',
+      enterGroup: 'Enter group',
+      enterDisabled: 'Only frames and groups with children can be entered',
+    }
+
+    const CONTEXT_MENU_CSS = `
+.dc-ctxmenu { position: fixed; z-index: 80; box-sizing: border-box; display: flex; flex-direction: column; gap: 1px; min-width: 200px; max-width: 280px; padding: 4px; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; background: var(--dsw-alias-bg-overlay, #ffffff); border: 1px solid var(--dsw-alias-border-l1, #e3e4e8); border-radius: 8px; box-shadow: 0 12px 32px rgba(15, 23, 42, 0.2), 0 2px 6px rgba(15, 23, 42, 0.08); font-size: 12px; }
+.dc-ctxmenu:focus { outline: none; }
+.dc-ctxmenu:focus-visible { outline: 2px solid var(--dsw-alias-brand-primary, #3b82f6); outline-offset: 2px; }
+.dcm-head { flex: 0 0 auto; max-width: 100%; padding: 3px 8px 5px; margin-bottom: 2px; border-bottom: 1px solid var(--dsw-alias-border-l1, #e3e4e8); font-size: 10.5px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: var(--dsw-alias-label-secondary, #6b7280); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dc-ctxmenu .dc-menu-item { flex: 0 0 auto; }
+.dc-ctxmenu .dc-menu-sep { flex: 0 0 auto; }
+.dc-ctxmenu .dc-menu-item[aria-disabled="true"] { opacity: 0.45; cursor: default; }
+.dc-ctxmenu .dc-menu-item[aria-disabled="true"]:hover { background: transparent; }
+.dc-ctxmenu .dc-menu-item.dcm-active:not([aria-disabled="true"]) { background: var(--dsw-alias-bg-layer-2, #f0f0f2); }
+@media (prefers-reduced-motion: no-preference) {
+  .dc-ctxmenu { animation: dcm-in 90ms ease-out; }
+  @keyframes dcm-in { from { opacity: 0.55; } to { opacity: 1; } }
+}
+`
+
+    /**
+     * Latest extension context seen by the menu component. Menu rows are built when the menu
+     * opens, but actions must run against the CURRENT editor context (the right-click applies a
+     * selection first, and the shell re-renders with a fresh context object), so run-time helpers
+     * read it from here instead of a captured open-time copy.
+     */
+    const CONTEXT_MENU_STATE = { liveCtx: null }
+
+    function contextMenuLiveCtx(fallback) {
+      return CONTEXT_MENU_STATE.liveCtx || fallback || null
+    }
+
+    /**
+     * Glyphs the shared set does not have. Kept here on purpose: `40-icons.js` is another part's
+     * file, so extra menu-only icons live in this file as inline paths on the same 16x16 grid.
+     */
+    const CONTEXT_MENU_ICON_PATHS = {
+      scissors: ['M4.5 3.5l7 7', 'M11.5 3.5l-7 7', 'M3.5 11a1.8 1.8 0 1 0 0 .01', 'M12.5 11a1.8 1.8 0 1 0 0 .01'],
+      clipboard: ['M5.5 3.5h5v-1h-5z', 'M4.5 3.5h-1v10h9v-10h-1', 'M6 7h4', 'M6 9.5h4'],
+      pencil: ['M3 13l.8-2.9 7-7 2.1 2.1-7 7z', 'M9.9 4.1l2.1 2.1'],
+      ungroup: ['M2.5 5.5V2.5h3', 'M13.5 10.5v3h-3', 'M7 7h2v2H7z'],
+      front: ['M5 12.5V6.5', 'M5 12.5h6', 'M8 2.5l4 4', 'M8 2.5l-4 4'],
+      back: ['M5 12.5V6.5', 'M5 12.5h6', 'M8 2.5l4 4', 'M8 2.5l-4 4'],
+      selectAll: ['M2.5 5V2.5H5', 'M11 2.5h2.5V5', 'M13.5 11v2.5H11', 'M5 13.5H2.5V11', 'M5.5 5.5h5v5h-5z'],
+      commentPlus: ['M2.5 3.5h11v7.5h-6l-3.5 2.5v-2.5h-1.5z', 'M8 5.8v3', 'M6.5 7.3h3'],
+    }
+
+    /** Render one menu glyph: the shared `Glyph` when the name exists, else a local inline SVG. */
+    function ContextMenuGlyph(props) {
+      const name = props && typeof props.name === 'string' ? props.name : ''
+      const size = (props && props.size) || 14
+      const extra = Object.prototype.hasOwnProperty.call(CONTEXT_MENU_ICON_PATHS, name)
+        ? CONTEXT_MENU_ICON_PATHS[name]
+        : null
+      if (!extra && typeof Glyph === 'function') return h(Glyph, { name: name, size: size })
+      const paths = extra || CONTEXT_MENU_ICON_PATHS.front
+      return h(
+        'svg',
+        {
+          width: size,
+          height: size,
+          viewBox: '0 0 16 16',
+          fill: 'none',
+          stroke: 'currentColor',
+          strokeWidth: 1.5,
+          strokeLinecap: 'round',
+          strokeLinejoin: 'round',
+          'aria-hidden': 'true',
+          focusable: 'false',
+          style: { flex: '0 0 auto', display: 'block' },
+        },
+        paths.map(function (path, index) {
+          return h('path', { key: index, d: path })
+        }),
+      )
+    }
+
+    /* ------------------------------------------------------------------------------------------
+     * Item model: declarative rows, so groups/separators/shortcuts/icons stay data
+     * ---------------------------------------------------------------------------------------- */
+
+    /** One actionable row: { id, label, shortcut?, icon?, disabled?, danger?, checked?, reason?, run }. */
+    function contextMenuItem(id, label, options) {
+      const extra = isObject(options) ? options : {}
+      return {
+        id: String(id || ''),
+        label: String(label || ''),
+        shortcut: typeof extra.shortcut === 'string' ? extra.shortcut : '',
+        icon: typeof extra.icon === 'string' ? extra.icon : '',
+        disabled: extra.disabled === true,
+        danger: extra.danger === true,
+        checked: extra.checked === true,
+        reason: typeof extra.reason === 'string' ? extra.reason : '',
+        run: typeof extra.run === 'function' ? extra.run : null,
+      }
+    }
+
+    /** A separator row (never focusable, never hoverable). */
+    function contextMenuSeparator(id) {
+      return { id: String(id || ''), separator: true }
+    }
+
+    function contextMenuItemDomId(item, index) {
+      const key = item && item.id ? String(item.id) : 'row'
+      return 'dcm-item-' + key.replace(/[^a-zA-Z0-9_-]/g, '-') + '-' + String(index)
+    }
+
+    function contextMenuFirstEnabledIndex(items) {
+      const list = Array.isArray(items) ? items : []
+      for (let index = 0; index < list.length; index += 1) {
+        const item = list[index]
+        if (item && !item.separator && !item.disabled) return index
+      }
+      return -1
+    }
+
+    /* ------------------------------------------------------------------------------------------
+     * DOM plumbing: app root, target resolution, focus helpers
+     * ---------------------------------------------------------------------------------------- */
+
+    function contextMenuAppNode(ctx) {
+      const editor = ctx && ctx.editor ? ctx.editor : null
+      const ref = editor && editor.appRef ? editor.appRef : null
+      const node = ref && ref.current ? ref.current : null
+      if (node && typeof node.getBoundingClientRect === 'function') return node
+      if (typeof document !== 'undefined' && document.querySelector) {
+        return document.querySelector('.dc-app')
+      }
+      return null
+    }
+
+    function contextMenuIsEditableTarget(node) {
+      if (!node) return false
+      const tag = String(node.tagName || '').toUpperCase()
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true
+      if (node.isContentEditable === true) return true
+      if (typeof node.closest === 'function') {
+        return !!node.closest('input, textarea, select, [contenteditable="true"]')
+      }
+      return false
+    }
+
+    /**
+     * Resolve the right-clicked element to a menu target:
+     *   layer (`[data-layer-id]`) -> artboard (`[data-artboard-id]` / `.dc-board-frame`) -> canvas.
+     * Layer ids are normalised to the editor's selection unit (a child of a group resolves to the
+     * group unless the user drilled in), so the menu always acts on what a click would select.
+     */
+    function contextMenuResolveTarget(node, appNode, ctx) {
+      if (!node || typeof node.closest !== 'function') return null
+      if (appNode && typeof appNode.contains === 'function' && !appNode.contains(node)) return null
+      const editor = ctx && ctx.editor ? ctx.editor : null
+      const layerElement = node.closest('[data-layer-id]')
+      if (layerElement) {
+        const rawId = String(layerElement.getAttribute('data-layer-id') || '')
+        if (!rawId) return null
+        let layerId = rawId
+        if (editor && typeof editor.nodeForLayer === 'function') {
+          const layerNode = editor.nodeForLayer(rawId)
+          const target =
+            layerNode && typeof editor.selectionTargetForNode === 'function'
+              ? editor.selectionTargetForNode(layerNode, editor.drillGroupId || null)
+              : layerNode
+          if (target && typeof target.id === 'string' && target.id) layerId = target.id
+        }
+        const boardElement = layerElement.closest('[data-artboard-id]')
+        const artboardId = boardElement ? String(boardElement.getAttribute('data-artboard-id') || '') : ''
+        return { kind: 'layer', layerId: layerId, rawLayerId: rawId, artboardId: artboardId }
+      }
+      const boardElement =
+        node.closest('[data-artboard-id]') ||
+        node.closest('.dc-board-frame') ||
+        node.closest('.dc-board-wrap')
+      if (boardElement) {
+        const owner =
+          typeof boardElement.getAttribute === 'function' &&
+          boardElement.getAttribute('data-artboard-id')
+            ? boardElement
+            : boardElement.closest('[data-artboard-id]')
+        const artboardId = owner ? String(owner.getAttribute('data-artboard-id') || '') : ''
+        if (artboardId) return { kind: 'artboard', artboardId: artboardId }
+      }
+      if (node.closest('.dc-canvas')) return { kind: 'canvas' }
+      return null
+    }
+
+    /** The tree row / artboard row element for an object (canvas layers are ignored on purpose). */
+    function contextMenuFindRow(appNode, attribute, id) {
+      if (!appNode || !id || typeof appNode.querySelectorAll !== 'function') return null
+      let rows = []
+      try {
+        rows = appNode.querySelectorAll('[' + attribute + ']')
+      } catch (error) {
+        return null
+      }
+      for (let index = 0; index < rows.length; index += 1) {
+        const row = rows[index]
+        if (!row || typeof row.closest !== 'function') continue
+        if (row.closest('.dc-canvas')) continue
+        if (String(row.getAttribute(attribute) || '') === String(id)) return row
+      }
+      return null
+    }
+
+    /** The inspector's Name field for the current selection, when it is showing that name. */
+    function contextMenuFindInspectorNameField(ctx, currentName) {
+      const appNode = contextMenuAppNode(ctx)
+      if (!appNode || typeof appNode.querySelector !== 'function') return null
+      const strings = (ctx && ctx.strings) || {}
+      const label = typeof strings.name === 'string' ? strings.name : ''
+      if (!label) return null
+      const scope =
+        appNode.querySelector('.dc-drawer-right') ||
+        appNode.querySelector('.dc-right') ||
+        appNode.querySelector('.dc-drawer')
+      if (!scope || typeof scope.querySelectorAll !== 'function') return null
+      const inputs = scope.querySelectorAll('input.dc-input')
+      for (let index = 0; index < inputs.length; index += 1) {
+        const input = inputs[index]
+        if (!input) continue
+        const title = String(input.getAttribute('title') || '')
+        if (title.indexOf(label) !== 0) continue
+        if (String(input.value || '') !== String(currentName || '')) continue
+        return input
+      }
+      return null
+    }
+
+    /**
+     * Open the app's REAL rename affordance instead of faking one: the tree row's double-click
+     * (its inline rename input focuses itself), else the inspector's Name field, else a toast
+     * pointing at the Layers panel.
+     */
+    function contextMenuStartRename(ctx, kind, id, currentName) {
+      const editor = (ctx && ctx.editor) || {}
+      const appNode = contextMenuAppNode(ctx)
+      const attribute = kind === 'artboard' ? 'data-artboard-id' : 'data-layer-id'
+      const row = contextMenuFindRow(appNode, attribute, id)
+      if (row && typeof row.dispatchEvent === 'function' && typeof window !== 'undefined' && typeof window.MouseEvent === 'function') {
+        try {
+          if (typeof row.focus === 'function') row.focus({ preventScroll: true })
+          row.dispatchEvent(
+            new window.MouseEvent('dblclick', { bubbles: true, cancelable: true, view: window }),
+          )
+          beacon('context-menu-rename', { kind: kind, source: 'tree' })
+          return true
+        } catch (error) {
+          beacon('context-menu-rename-failed', { kind: kind, message: shortError(error) })
+        }
+      }
+      const field = contextMenuFindInspectorNameField(ctx, currentName)
+      if (field && typeof field.focus === 'function') {
+        try {
+          field.focus({ preventScroll: true })
+          if (typeof field.select === 'function') field.select()
+          beacon('context-menu-rename', { kind: kind, source: 'inspector' })
+          return true
+        } catch (error) {
+          beacon('context-menu-rename-failed', { kind: kind, message: shortError(error) })
+        }
+      }
+      if (typeof editor.setInlineError === 'function') editor.setInlineError(CONTEXT_MENU_COPY.renameUnavailable)
+      beacon('context-menu-rename', { kind: kind, source: 'unavailable' })
+      return false
+    }
+
+    /* ------------------------------------------------------------------------------------------
+     * Editing actions (small wrappers so item rows stay declarative)
+     * ---------------------------------------------------------------------------------------- */
+
+    function contextMenuReport(ctx, message) {
+      const text = String(message || '')
+      const live = contextMenuLiveCtx(ctx) || {}
+      const editor = (live && live.editor) || (ctx && ctx.editor) || {}
+      if (text && typeof editor.setInlineError === 'function') {
+        try {
+          editor.setInlineError(text)
+        } catch (error) {
+          beacon('context-menu-report-failed', { message: shortError(error) })
+        }
+      }
+      beacon('context-menu-info', { message: text.slice(0, 150) })
+    }
+
+    function contextMenuFindArtboard(ctx, artboardId) {
+      const doc = ctx && ctx.doc
+      const boards = doc && Array.isArray(doc.artboards) ? doc.artboards : []
+      for (let index = 0; index < boards.length; index += 1) {
+        const board = boards[index]
+        if (board && board.id === artboardId) return board
+      }
+      return null
+    }
+
+    /** Layer type label from the defaults part, without depending on it being present. */
+    function contextMenuTypeLabel(type) {
+      if (typeof layerTypeLabel === 'function') return layerTypeLabel(type)
+      return String(type || 'layer')
+    }
+
+    function contextMenuLayerNodes(ctx, ids) {
+      const editor = (ctx && ctx.editor) || {}
+      const list = Array.isArray(ids) ? ids : []
+      const nodes = []
+      for (let index = 0; index < list.length; index += 1) {
+        if (typeof editor.nodeForLayer !== 'function') break
+        const node = editor.nodeForLayer(list[index])
+        if (node) nodes.push(node)
+      }
+      return nodes
+    }
+
+    /**
+     * "Frame selection": create a frame at the union box of the selection and move each selected
+     * root into it (one op batch, one undo entry). Moved children keep their visual position by
+     * rewriting x/y relative to the new frame — `layer.move_to` does not convert coordinates.
+     */
+    function contextMenuFrameSelection(ctx) {
+      const editor = (ctx && ctx.editor) || {}
+      const selected = Array.isArray(editor.selectedLayerIds) ? editor.selectedLayerIds : []
+      const roots =
+        typeof editor.rootSelectionIds === 'function' ? editor.rootSelectionIds(selected) : selected.slice()
+      if (!roots.length) {
+        contextMenuReport(ctx, CONTEXT_MENU_COPY.frameEmpty)
+        return false
+      }
+      const bounds = typeof editor.selectionBounds === 'function' ? editor.selectionBounds(roots) : null
+      const nodes = contextMenuLayerNodes(ctx, roots)
+      if (!bounds || !(bounds.width > 0) || !(bounds.height > 0) || !nodes.length) {
+        contextMenuReport(ctx, CONTEXT_MENU_COPY.frameEmpty)
+        return false
+      }
+      const artboardId =
+        typeof editor.artboardIdForLayer === 'function' ? editor.artboardIdForLayer(nodes[0].id) : null
+      if (!artboardId) {
+        contextMenuReport(ctx, CONTEXT_MENU_COPY.frameEmpty)
+        return false
+      }
+      const frameId = makeId('l')
+      const baseX = Math.round(bounds.x)
+      const baseY = Math.round(bounds.y)
+      const ops = [
+        {
+          type: 'layer.add',
+          artboardId: artboardId,
+          layer: {
+            id: frameId,
+            type: 'frame',
+            name: CONTEXT_MENU_COPY.frameName,
+            x: baseX,
+            y: baseY,
+            width: Math.max(1, Math.round(bounds.width)),
+            height: Math.max(1, Math.round(bounds.height)),
+            fill: '#ffffff',
+            radius: 0,
+            clip: false,
+          },
+        },
+      ]
+      const inverse = []
+      for (let index = 0; index < nodes.length; index += 1) {
+        const node = nodes[index]
+        if (!node || !node.id) continue
+        ops.push({ type: 'layer.move_to', layerId: node.id, parentId: frameId })
+        ops.push({
+          type: 'layer.update',
+          layerId: node.id,
+          patch: {
+            x: Math.round(node.worldRect.x) - baseX,
+            y: Math.round(node.worldRect.y) - baseY,
+          },
+        })
+        const restore = { type: 'layer.move_to', layerId: node.id, index: node.index }
+        if (node.parentId) restore.parentId = node.parentId
+        else restore.artboardId = node.artboard.id
+        inverse.push(restore)
+        inverse.push({
+          type: 'layer.update',
+          layerId: node.id,
+          patch: { x: finiteNumber(node.x, 0), y: finiteNumber(node.y, 0) },
+        })
+      }
+      inverse.push({ type: 'layer.delete', layerId: frameId })
+      const done = function (result) {
+        if (!result || result.ok === false) return
+        if (typeof editor.selectLayer === 'function') editor.selectLayer(frameId, artboardId)
+        contextMenuReport(ctx, CONTEXT_MENU_COPY.framed)
+      }
+      const pending =
+        typeof editor.commitWithHistory === 'function'
+          ? editor.commitWithHistory('frame-selection', ops, inverse)
+          : typeof editor.runOps === 'function'
+            ? editor.runOps(ops)
+            : null
+      if (!pending) return false
+      if (typeof pending.then === 'function') pending.then(done)
+      return true
+    }
+
+    /** Duplicate an artboard (no editor API yet: runOps + a history entry once the id is known). */
+    function contextMenuDuplicateArtboard(ctx, artboardId) {
+      const editor = (ctx && ctx.editor) || {}
+      const op = { type: 'artboard.duplicate', artboardId: artboardId }
+      if (typeof editor.runOps !== 'function') return false
+      const done = function (result) {
+        if (!result || result.ok === false) return
+        const applied = Array.isArray(result.applied) ? result.applied : []
+        let newId = ''
+        for (let index = 0; index < applied.length; index += 1) {
+          const entry = applied[index]
+          if (entry && entry.type === 'artboard.duplicate' && typeof entry.id === 'string' && entry.id) {
+            newId = entry.id
+          }
+        }
+        if (newId && typeof editor.pushHistoryEntry === 'function') {
+          editor.pushHistoryEntry('duplicate-artboard', [op], [
+            { type: 'artboard.delete', artboardId: newId },
+          ])
+        }
+        if (newId && typeof editor.selectArtboard === 'function') editor.selectArtboard(newId)
+        contextMenuReport(ctx, CONTEXT_MENU_COPY.artboardDuplicated)
+      }
+      const pending = editor.runOps([op])
+      if (pending && typeof pending.then === 'function') pending.then(done)
+      return true
+    }
+
+    /** Frame one artboard in the viewport (camera math; falls back to select + fit). */
+    function contextMenuFitArtboard(ctx, artboardId) {
+      const editor = (ctx && ctx.editor) || {}
+      const board = contextMenuFindArtboard(ctx, artboardId)
+      const layout = (ctx && ctx.layout) || null
+      const entry =
+        layout && layout.entryById && typeof layout.entryById.get === 'function'
+          ? layout.entryById.get(artboardId) || null
+          : null
+      const canCompute =
+        !!board &&
+        !!entry &&
+        typeof editor.setCameraValue === 'function' &&
+        typeof editor.canvasViewport === 'function'
+      if (!canCompute) {
+        if (typeof editor.selectArtboard === 'function') editor.selectArtboard(artboardId)
+        if (typeof editor.fitCamera === 'function') {
+          editor.fitCamera()
+          return true
+        }
+        contextMenuReport(ctx, CONTEXT_MENU_COPY.fitUnavailable)
+        return false
+      }
+      const viewport = editor.canvasViewport()
+      const width = Math.max(1, finiteNumber(board.width, 1))
+      const height = Math.max(1, finiteNumber(board.height, 1))
+      const fitZoom = Math.min(
+        Math.max(120, viewport.width - FIT_PADDING) / width,
+        Math.max(120, viewport.height - FIT_PADDING) / height,
+      )
+      const zoom = Math.round(Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, fitZoom)) * 100) / 100
+      const centerX = finiteNumber(entry.frameX, 0) + width / 2
+      const centerY = finiteNumber(entry.frameY, 0) + height / 2
+      if (typeof editor.selectArtboard === 'function') editor.selectArtboard(artboardId)
+      editor.setCameraValue({
+        x: Math.round(viewport.width / 2 - centerX * zoom),
+        y: Math.round(viewport.height / 2 - centerY * zoom),
+        zoom: zoom,
+      })
+      beacon('context-menu-fit-artboard', { artboardId: artboardId, zoom: zoom })
+      return true
+    }
+
+    /* ------------------------------------------------------------------------------------------
+     * Export bridges (feature-detected: the export part owns the renderers)
+     * ---------------------------------------------------------------------------------------- */
+
+    function contextMenuSelectionCopyAvailable(ctx) {
+      const editor = (ctx && ctx.editor) || (contextMenuLiveCtx(ctx) || {}).editor || {}
+      return typeof editor.copySelectionAs === 'function' || typeof copySelectionAs === 'function'
+    }
+
+    function contextMenuArtboardCopyAvailable() {
+      return typeof renderSvg === 'function' && typeof copyTextToClipboard === 'function'
+    }
+
+    function contextMenuExportAvailable() {
+      return typeof openExportDialog === 'function'
+    }
+
+    function contextMenuOpenExport(ctx, patch) {
+      if (!contextMenuExportAvailable()) {
+        contextMenuReport(ctx, CONTEXT_MENU_COPY.exportUnavailable)
+        return false
+      }
+      try {
+        openExportDialog(patch || {})
+        return true
+      } catch (error) {
+        contextMenuReport(ctx, CONTEXT_MENU_COPY.exportUnavailable)
+        beacon('context-menu-export-failed', { message: shortError(error) })
+        return false
+      }
+    }
+
+    /** Decode a PNG data URL and put the image on the clipboard (no network involved). */
+    function contextMenuWriteClipboardImage(dataUrl) {
+      const text = String(dataUrl || '')
+      const comma = text.indexOf(',')
+      if (comma < 0) return Promise.reject(new Error('image data is not a data URL'))
+      const header = text.slice(0, comma)
+      const payload = text.slice(comma + 1)
+      if (header.indexOf('base64') < 0) return Promise.reject(new Error('image data is not base64'))
+      let bytes = null
+      try {
+        const binary = typeof atob === 'function' ? atob(payload) : ''
+        bytes = new Uint8Array(binary.length)
+        for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index)
+      } catch (error) {
+        return Promise.reject(error)
+      }
+      const clipboard = typeof navigator !== 'undefined' ? navigator.clipboard : null
+      const ClipboardItemCtor = typeof window !== 'undefined' ? window.ClipboardItem : null
+      if (!clipboard || typeof clipboard.write !== 'function' || typeof ClipboardItemCtor !== 'function') {
+        return Promise.reject(new Error('this browser cannot put images on the clipboard'))
+      }
+      const blob = new Blob([bytes], { type: 'image/png' })
+      return clipboard.write([new ClipboardItemCtor({ 'image/png': blob })])
+    }
+
+    /** Copy one artboard as SVG/PNG through the export renderers (artboard scope is exact). */
+    function contextMenuCopyArtboard(ctx, artboardId, format) {
+      const live = contextMenuLiveCtx(ctx) || {}
+      const doc = live.doc
+      if (!doc) return false
+      if (format === 'png') {
+        if (typeof renderPngDataUrl !== 'function') {
+          contextMenuReport(ctx, CONTEXT_MENU_COPY.copyUnavailable)
+          return false
+        }
+        const pending = Promise.resolve(
+          renderPngDataUrl(doc, { scope: 'artboard', artboardId: artboardId, scale: 2 }),
+        )
+        pending
+          .then(function (dataUrl) {
+            return contextMenuWriteClipboardImage(dataUrl)
+          })
+          .then(function () {
+            contextMenuReport(live, CONTEXT_MENU_COPY.copiedArtboardPng)
+          })
+          .catch(function (error) {
+            contextMenuReport(ctx, CONTEXT_MENU_COPY.copyFailed + ': ' + shortError(error))
+          })
+        return true
+      }
+      if (!contextMenuArtboardCopyAvailable()) {
+        contextMenuReport(ctx, CONTEXT_MENU_COPY.copyUnavailable)
+        return false
+      }
+      try {
+        const svg = renderSvg(doc, { scope: 'artboard', artboardId: artboardId })
+        const pending = copyTextToClipboard(svg)
+        if (pending && typeof pending.then === 'function') {
+          pending.then(function (ok) {
+            contextMenuReport(live, ok === false ? CONTEXT_MENU_COPY.copyFailed : CONTEXT_MENU_COPY.copiedArtboardSvg)
+          })
+        } else {
+          contextMenuReport(live, CONTEXT_MENU_COPY.copiedArtboardSvg)
+        }
+        return true
+      } catch (error) {
+        contextMenuReport(ctx, CONTEXT_MENU_COPY.copyFailed + ': ' + shortError(error))
+        return false
+      }
+    }
+
+    /** Copy the CURRENT selection as PNG/SVG through the export part's `copySelectionAs`. */
+    function contextMenuCopySelection(ctx, format) {
+      const live = contextMenuLiveCtx(ctx) || {}
+      const editor = live.editor || (ctx && ctx.editor) || {}
+      const copy = typeof editor.copySelectionAs === 'function' ? editor.copySelectionAs : null
+      const fallback = typeof copySelectionAs === 'function' ? copySelectionAs : null
+      if (!copy && !fallback) {
+        contextMenuReport(live, CONTEXT_MENU_COPY.copyUnavailable)
+        return false
+      }
+      try {
+        // Signature: copySelectionAs(format, api). It reads the CURRENT selection from the passed
+        // context, so hand it the live extension context (the right-click selected the layer).
+        const pending = copy ? copy.call(editor, format, live) : fallback(format, live)
+        if (pending && typeof pending.then === 'function') {
+          pending.catch(function (error) {
+            contextMenuReport(live, CONTEXT_MENU_COPY.copyFailed + ': ' + shortError(error))
+          })
+        }
+        return true
+      } catch (error) {
+        contextMenuReport(live, CONTEXT_MENU_COPY.copyFailed + ': ' + shortError(error))
+        return false
+      }
+    }
+
+    /** Open the keyboard-shortcuts sheet through whichever hook this build provides. */
+    function contextMenuOpenShortcuts(ctx) {
+      if (typeof openShortcutsSheet === 'function') {
+        try {
+          openShortcutsSheet()
+          return true
+        } catch (error) {
+          beacon('context-menu-shortcuts-failed', { message: shortError(error) })
+        }
+      }
+      if (Array.isArray(EXTENSIONS.commands)) {
+        for (let index = 0; index < EXTENSIONS.commands.length; index += 1) {
+          const entry = EXTENSIONS.commands[index]
+          if (!entry || typeof entry.run !== 'function') continue
+          const id = String(entry.id || '')
+          if (id.indexOf('shortcut') < 0) continue
+          try {
+            if (entry.run((ctx && ctx.editor) || {}) !== false) return true
+          } catch (error) {
+            beacon('context-menu-shortcuts-failed', { message: shortError(error) })
+          }
+        }
+      }
+      contextMenuReport(ctx, CONTEXT_MENU_COPY.shortcutsUnavailable)
+      return false
+    }
+
+    /* ------------------------------------------------------------------------------------------
+     * Menu 1/3 — a layer (or a multi-layer selection)
+     * ---------------------------------------------------------------------------------------- */
+
+    function contextMenuLayerItems(ctx, info) {
+      const editor = (ctx && ctx.editor) || {}
+      const ids =
+        Array.isArray(info.selectionIds) && info.selectionIds.length
+          ? info.selectionIds
+          : [info.layerId].filter(Boolean)
+      const nodes = contextMenuLayerNodes(ctx, ids)
+      const primaryNode =
+        typeof editor.nodeForLayer === 'function' ? editor.nodeForLayer(info.layerId) : nodes[0] || null
+      const layer = primaryNode && primaryNode.layer ? primaryNode.layer : null
+      const artboardId =
+        (primaryNode && primaryNode.artboard && primaryNode.artboard.id) || info.artboardId || ''
+      const multi = ids.length > 1
+      const locked = !!(layer && layer.locked === true)
+      const hidden = !!(layer && layer.visible === false)
+      const allLocked = nodes.length > 0 && nodes.every(function (node) {
+        return !!(node && node.layer && node.layer.locked === true)
+      })
+      const hasGroup = nodes.some(function (node) {
+        return !!(node && node.type === 'group')
+      })
+      const isContainer = !!(
+        primaryNode &&
+        (primaryNode.type === 'frame' || primaryNode.type === 'group') &&
+        Array.isArray(primaryNode.children) &&
+        primaryNode.children.length
+      )
+      const copyAvailable = contextMenuSelectionCopyAvailable(ctx)
+      const exportAvailable = contextMenuExportAvailable()
+      const canRun = function (fn) {
+        return function () {
+          try {
+            return fn()
+          } catch (error) {
+            contextMenuReport(ctx, CONTEXT_MENU_COPY.actionFailed + ': ' + shortError(error))
+            return false
+          }
+        }
+      }
+      const call = function (name) {
+        return function () {
+          if (typeof editor[name] === 'function') return editor[name]()
+          return false
+        }
+      }
+
+      const items = [
+        contextMenuItem('copy', 'Copy', {
+          shortcut: 'Ctrl/Cmd+C',
+          icon: 'copy',
+          disabled: !ids.length,
+          run: call('copySelection'),
+        }),
+        contextMenuItem('cut', 'Cut', {
+          shortcut: 'Ctrl/Cmd+X',
+          icon: 'scissors',
+          disabled: locked || !ids.length,
+          reason: locked ? 'The layer is locked — unlock it first' : '',
+          run: call('cutSelection'),
+        }),
+        contextMenuItem('paste', 'Paste', {
+          shortcut: 'Ctrl/Cmd+V',
+          icon: 'clipboard',
+          run: call('pasteSelection'),
+        }),
+        contextMenuItem('duplicate', 'Duplicate', {
+          shortcut: 'Ctrl/Cmd+D',
+          icon: 'copy',
+          disabled: locked,
+          reason: locked ? 'The layer is locked — unlock it first' : '',
+          run: call('duplicateSelected'),
+        }),
+        contextMenuItem('delete', 'Delete', {
+          shortcut: 'Del',
+          icon: 'trash',
+          danger: true,
+          disabled: locked,
+          reason: locked ? 'The layer is locked — unlock it first' : '',
+          run: call('deleteSelectedLayer'),
+        }),
+        contextMenuSeparator('sep-edit'),
+        contextMenuItem('rename', 'Rename…', {
+          icon: 'pencil',
+          disabled: !layer,
+          run: function () {
+            return contextMenuStartRename(ctx, 'layer', info.layerId, layer ? layer.name : '')
+          },
+        }),
+        contextMenuItem('comment', 'Add comment', {
+          icon: 'comment',
+          disabled: !primaryNode || typeof editor.openComposerFor !== 'function',
+          reason: 'Comments need a layer target',
+          run: function () {
+            if (typeof editor.openComposerFor !== 'function' || !info.layerId) return false
+            editor.openComposerFor(info.layerId, artboardId || null)
+            return true
+          },
+        }),
+        contextMenuItem(
+          'enter',
+          primaryNode && primaryNode.type === 'group' ? CONTEXT_MENU_COPY.enterGroup : CONTEXT_MENU_COPY.enterSelection,
+          {
+            shortcut: '↵',
+            icon: 'chevronRight',
+            disabled: !isContainer || typeof editor.drillIntoSelection !== 'function',
+            reason: CONTEXT_MENU_COPY.enterDisabled,
+            run: function () {
+              if (typeof editor.drillIntoSelection !== 'function') return false
+              return editor.drillIntoSelection()
+            },
+          },
+        ),
+        contextMenuSeparator('sep-structure'),
+        contextMenuItem('group', 'Group selection', {
+          shortcut: 'Ctrl/Cmd+G',
+          icon: 'group',
+          disabled: ids.length < 2 || locked || typeof editor.groupSelection !== 'function',
+          reason: ids.length < 2 ? 'Select at least two layers' : locked ? 'The layer is locked' : '',
+          run: canRun(function () {
+            const pending = editor.groupSelection()
+            if (pending && typeof pending.catch === 'function') {
+              pending.catch(function (error) {
+                contextMenuReport(ctx, shortError(error))
+              })
+            }
+            return true
+          }),
+        }),
+        contextMenuItem('ungroup', 'Ungroup', {
+          shortcut: 'Ctrl/Cmd+Shift+G',
+          icon: 'ungroup',
+          disabled: !hasGroup || locked || typeof editor.ungroupSelection !== 'function',
+          reason: hasGroup ? (locked ? 'The layer is locked' : '') : 'The selection has no group',
+          run: call('ungroupSelection'),
+        }),
+        contextMenuItem('frame-selection', 'Frame selection', {
+          icon: 'frame',
+          disabled: !ids.length || locked || typeof editor.runOps !== 'function',
+          reason: locked ? 'The layer is locked' : '',
+          run: function () {
+            return contextMenuFrameSelection(ctx)
+          },
+        }),
+        contextMenuSeparator('sep-arrange'),
+        contextMenuItem('bring-front', 'Bring to front', {
+          shortcut: 'Ctrl/Cmd+Shift+]',
+          icon: 'front',
+          disabled: locked || typeof editor.arrangeSelection !== 'function',
+          run: function () {
+            return typeof editor.arrangeSelection === 'function' ? editor.arrangeSelection('front') : false
+          },
+        }),
+        contextMenuItem('bring-forward', 'Bring forward', {
+          shortcut: 'Ctrl/Cmd+]',
+          icon: 'up',
+          disabled: locked || typeof editor.arrangeSelection !== 'function',
+          run: function () {
+            return typeof editor.arrangeSelection === 'function'
+              ? editor.arrangeSelection('forward')
+              : false
+          },
+        }),
+        contextMenuItem('send-backward', 'Send backward', {
+          shortcut: 'Ctrl/Cmd+[',
+          icon: 'down',
+          disabled: locked || typeof editor.arrangeSelection !== 'function',
+          run: function () {
+            return typeof editor.arrangeSelection === 'function'
+              ? editor.arrangeSelection('backward')
+              : false
+          },
+        }),
+        contextMenuItem('send-back', 'Send to back', {
+          shortcut: 'Ctrl/Cmd+Shift+[',
+          icon: 'back',
+          disabled: locked || typeof editor.arrangeSelection !== 'function',
+          run: function () {
+            return typeof editor.arrangeSelection === 'function' ? editor.arrangeSelection('back') : false
+          },
+        }),
+        contextMenuSeparator('sep-state'),
+        contextMenuItem(allLocked ? 'unlock' : 'lock', allLocked ? 'Unlock' : 'Lock', {
+          icon: allLocked ? 'unlock' : 'lock',
+          disabled: !ids.length || typeof editor.toggleLock !== 'function',
+          run: call('toggleLock'),
+        }),
+        contextMenuItem(hidden ? 'show' : 'hide', hidden ? 'Show' : 'Hide', {
+          icon: hidden ? 'eyeOff' : 'eye',
+          disabled: !ids.length || typeof editor.toggleVisible !== 'function',
+          title: multi ? 'Applies to every selected layer' : '',
+          run: function () {
+            if (typeof editor.toggleVisible !== 'function') return false
+            for (let index = 0; index < ids.length; index += 1) editor.toggleVisible(ids[index])
+            return true
+          },
+        }),
+        contextMenuSeparator('sep-copy'),
+        contextMenuItem('copy-png', 'Copy as PNG', {
+          icon: 'image',
+          disabled: !copyAvailable,
+          reason: CONTEXT_MENU_COPY.copyUnavailable,
+          run: function () {
+            return contextMenuCopySelection(ctx, 'png')
+          },
+        }),
+        contextMenuItem('copy-svg', 'Copy as SVG', {
+          icon: 'export',
+          disabled: !copyAvailable,
+          reason: CONTEXT_MENU_COPY.copyUnavailable,
+          run: function () {
+            return contextMenuCopySelection(ctx, 'svg')
+          },
+        }),
+        contextMenuItem(multi ? 'export-selection' : 'export-layer', multi ? 'Export selection…' : 'Export layer…', {
+          icon: 'export',
+          disabled: !exportAvailable,
+          reason: CONTEXT_MENU_COPY.exportUnavailable,
+          run: function () {
+            return contextMenuOpenExport(ctx, {
+              scope: 'selection',
+              artboardId: artboardId,
+              layerIds: ids.slice(),
+            })
+          },
+        }),
+      ]
+      if (info.rawLayerId && info.rawLayerId !== info.layerId) {
+        // The element under the pointer belongs to a group: say which unit the menu acts on.
+        items.push(contextMenuSeparator('sep-group-note'))
+        items.push(
+          contextMenuItem('select-child', 'Right-click again to pick the child', {
+            icon: 'search',
+            disabled: true,
+            reason: 'Drill into the group (Enter) to target its children',
+          }),
+        )
+      }
+      const label = multi
+        ? String(ids.length) + ' ' + CONTEXT_MENU_COPY.layers + ' ' + CONTEXT_MENU_COPY.selected
+        : contextMenuTypeLabel(layer ? layer.type : primaryNode ? primaryNode.type : 'layer') +
+          (layer && layer.name ? ' · ' + layer.name : '')
+      return { label: label, items: items }
+    }
+
+    /* ------------------------------------------------------------------------------------------
+     * Menu 2/3 — an artboard
+     * ---------------------------------------------------------------------------------------- */
+
+    function contextMenuArtboardItems(ctx, info) {
+      const editor = (ctx && ctx.editor) || {}
+      const board = contextMenuFindArtboard(ctx, info.artboardId)
+      const artboardId = info.artboardId
+      const copyAvailable = contextMenuArtboardCopyAvailable()
+      const exportAvailable = contextMenuExportAvailable()
+      const items = [
+        contextMenuItem('rename-artboard', 'Rename artboard…', {
+          icon: 'pencil',
+          disabled: !board,
+          run: function () {
+            return contextMenuStartRename(ctx, 'artboard', artboardId, board ? board.name : '')
+          },
+        }),
+        contextMenuItem('duplicate-artboard', 'Duplicate artboard', {
+          icon: 'copy',
+          disabled: !board || typeof editor.runOps !== 'function',
+          reason: 'Duplicating needs the ops bridge',
+          run: function () {
+            return contextMenuDuplicateArtboard(ctx, artboardId)
+          },
+        }),
+        contextMenuItem('delete-artboard', 'Delete artboard', {
+          icon: 'trash',
+          danger: true,
+          disabled: !board || typeof editor.deleteArtboard !== 'function',
+          reason: 'Deleting needs the editor bridge',
+          run: function () {
+            return typeof editor.deleteArtboard === 'function' ? editor.deleteArtboard(artboardId) : false
+          },
+        }),
+        contextMenuSeparator('sep-comment'),
+        contextMenuItem('comment-artboard', 'Add comment…', {
+          icon: 'comment',
+          disabled: typeof editor.setCommentMode !== 'function',
+          reason: 'Comment mode is not available',
+          run: function () {
+            if (typeof editor.setCommentMode !== 'function') return false
+            editor.setCommentMode(true)
+            contextMenuReport(ctx, CONTEXT_MENU_COPY.commentModeHint)
+            return true
+          },
+        }),
+        contextMenuSeparator('sep-copy'),
+        contextMenuItem('copy-artboard-png', 'Copy as PNG', {
+          icon: 'image',
+          disabled: !copyAvailable,
+          reason: CONTEXT_MENU_COPY.copyUnavailable,
+          run: function () {
+            return contextMenuCopyArtboard(ctx, artboardId, 'png')
+          },
+        }),
+        contextMenuItem('copy-artboard-svg', 'Copy as SVG', {
+          icon: 'export',
+          disabled: !copyAvailable,
+          reason: CONTEXT_MENU_COPY.copyUnavailable,
+          run: function () {
+            return contextMenuCopyArtboard(ctx, artboardId, 'svg')
+          },
+        }),
+        contextMenuItem('export-artboard', 'Export artboard…', {
+          icon: 'export',
+          disabled: !exportAvailable,
+          reason: CONTEXT_MENU_COPY.exportUnavailable,
+          run: function () {
+            return contextMenuOpenExport(ctx, { scope: 'artboard', artboardId: artboardId })
+          },
+        }),
+        contextMenuSeparator('sep-view'),
+        contextMenuItem('fit-artboard', 'Fit to artboard', {
+          icon: 'fit',
+          disabled: !board,
+          run: function () {
+            return contextMenuFitArtboard(ctx, artboardId)
+          },
+        }),
+        contextMenuItem('select-all-artboard', 'Select all in artboard', {
+          shortcut: 'Ctrl/Cmd+A',
+          icon: 'selectAll',
+          disabled: typeof editor.selectAllInArtboard !== 'function',
+          run: function () {
+            if (typeof editor.selectAllInArtboard !== 'function') return false
+            if (typeof editor.selectArtboard === 'function') editor.selectArtboard(artboardId)
+            editor.selectAllInArtboard()
+            return true
+          },
+        }),
+      ]
+      const label = (board && board.name ? String(board.name) : 'Artboard') + ' · artboard'
+      return { label: label, items: items }
+    }
+
+    /* ------------------------------------------------------------------------------------------
+     * Menu 3/3 — the empty canvas
+     * ---------------------------------------------------------------------------------------- */
+
+    function contextMenuCanvasItems(ctx, info) {
+      const editor = (ctx && ctx.editor) || {}
+      const doc = ctx && ctx.doc
+      const boards = doc && Array.isArray(doc.artboards) ? doc.artboards : []
+      const commentMode = editor.commentMode === true
+      const shortcutsAvailable =
+        typeof openShortcutsSheet === 'function' ||
+        (Array.isArray(EXTENSIONS.commands) &&
+          EXTENSIONS.commands.some(function (entry) {
+            return !!(entry && typeof entry.run === 'function' && String(entry.id || '').indexOf('shortcut') >= 0)
+          }))
+      const items = [
+        contextMenuItem('paste-here', 'Paste here', {
+          shortcut: 'Ctrl/Cmd+V',
+          icon: 'clipboard',
+          run: function () {
+            if (typeof editor.pasteSelection !== 'function') return false
+            const pending = editor.pasteSelection()
+            if (pending && typeof pending.catch === 'function') {
+              pending.catch(function (error) {
+                contextMenuReport(ctx, shortError(error))
+              })
+            }
+            return true
+          },
+        }),
+        contextMenuItem('select-all', 'Select all', {
+          shortcut: 'Ctrl/Cmd+A',
+          icon: 'selectAll',
+          disabled: !boards.length || typeof editor.selectAllInArtboard !== 'function',
+          reason: CONTEXT_MENU_COPY.noArtboards,
+          run: function () {
+            return typeof editor.selectAllInArtboard === 'function' ? editor.selectAllInArtboard() : false
+          },
+        }),
+        contextMenuSeparator('sep-create'),
+        contextMenuItem('add-artboard', 'Add artboard', {
+          icon: 'plus',
+          disabled: typeof editor.addArtboard !== 'function',
+          run: function () {
+            return typeof editor.addArtboard === 'function' ? editor.addArtboard() : false
+          },
+        }),
+        contextMenuItem('comment-mode', 'Comment mode', {
+          icon: 'comment',
+          checked: commentMode,
+          disabled: typeof editor.setCommentMode !== 'function',
+          run: function () {
+            if (typeof editor.setCommentMode !== 'function') return false
+            editor.setCommentMode(!commentMode)
+            return true
+          },
+        }),
+        contextMenuSeparator('sep-view'),
+        contextMenuItem('zoom-in', 'Zoom in', {
+          icon: 'plus',
+          disabled: typeof editor.zoomCameraBy !== 'function',
+          run: function () {
+            return typeof editor.zoomCameraBy === 'function' ? editor.zoomCameraBy(ZOOM_STEP) : false
+          },
+        }),
+        contextMenuItem('zoom-out', 'Zoom out', {
+          icon: 'minus',
+          disabled: typeof editor.zoomCameraBy !== 'function',
+          run: function () {
+            return typeof editor.zoomCameraBy === 'function' ? editor.zoomCameraBy(-ZOOM_STEP) : false
+          },
+        }),
+        contextMenuItem('fit-canvas', 'Fit canvas', {
+          icon: 'fit',
+          disabled: typeof editor.fitCamera !== 'function',
+          run: function () {
+            return typeof editor.fitCamera === 'function' ? editor.fitCamera() : false
+          },
+        }),
+        contextMenuSeparator('sep-help'),
+        contextMenuItem('shortcuts', 'Keyboard shortcuts…', {
+          icon: 'keyboard',
+          disabled: !shortcutsAvailable,
+          reason: CONTEXT_MENU_COPY.shortcutsUnavailable,
+          run: function () {
+            return contextMenuOpenShortcuts(ctx)
+          },
+        }),
+      ]
+      const name = doc && typeof doc.name === 'string' && doc.name ? doc.name : CONTEXT_MENU_COPY.canvas
+      return { label: name, items: items }
+    }
+
+    /** Build the whole menu for a resolved target (items are frozen at open time). */
+    function contextMenuBuildMenu(ctx, info) {
+      const target = info && info.kind ? info : { kind: 'canvas' }
+      const model =
+        target.kind === 'layer'
+          ? contextMenuLayerItems(ctx, target)
+          : target.kind === 'artboard'
+            ? contextMenuArtboardItems(ctx, target)
+            : contextMenuCanvasItems(ctx, target)
+      const items = Array.isArray(model.items) ? model.items.filter(Boolean) : []
+      const targetKey =
+        target.kind === 'layer'
+          ? 'layer:' + String(target.layerId || '')
+          : target.kind === 'artboard'
+            ? 'artboard:' + String(target.artboardId || '')
+            : 'canvas'
+      const ids = []
+      for (let index = 0; index < items.length; index += 1) {
+        const item = items[index]
+        if (!item || item.separator || !item.id) continue
+        ids.push(item.id + (item.disabled ? '(off)' : ''))
+      }
+      return {
+        label:
+          target.kind === 'layer'
+            ? CONTEXT_MENU_COPY.layerMenu
+            : target.kind === 'artboard'
+              ? CONTEXT_MENU_COPY.artboardMenu
+              : CONTEXT_MENU_COPY.canvasMenu,
+        heading: model.label,
+        items: items,
+        beaconTarget: targetKey,
+        beaconItems: ids.slice(0, 24).join(','),
+      }
+    }
+
+    /* ------------------------------------------------------------------------------------------
+     * Positioning: fixed at the pointer, flipped/clamped inside the panel, 6 px margins
+     * ---------------------------------------------------------------------------------------- */
+
+    function contextMenuPlaceMenu(node, pointX, pointY, appNode) {
+      if (!node || typeof node.getBoundingClientRect !== 'function') return
+      const margin = 6
+      const viewportWidth =
+        typeof window !== 'undefined' ? Math.max(1, window.innerWidth || 0) : 1024
+      const viewportHeight =
+        typeof window !== 'undefined' ? Math.max(1, window.innerHeight || 0) : 768
+      let bounds = {
+        left: margin,
+        top: margin,
+        right: viewportWidth - margin,
+        bottom: viewportHeight - margin,
+      }
+      let panel = null
+      try {
+        panel = appNode && typeof appNode.getBoundingClientRect === 'function' ? appNode.getBoundingClientRect() : null
+      } catch (error) {
+        panel = null
+      }
+      if (panel && panel.width > 40 && panel.height > 40) {
+        bounds = {
+          left: panel.left + margin,
+          top: panel.top + margin,
+          right: panel.right - margin,
+          bottom: panel.bottom - margin,
+        }
+      }
+      if (bounds.right - bounds.left < 120 || bounds.bottom - bounds.top < 120) {
+        bounds = {
+          left: margin,
+          top: margin,
+          right: viewportWidth - margin,
+          bottom: viewportHeight - margin,
+        }
+      }
+      // 1) Park it at the pointer to learn how this containing block maps to the viewport
+      //    (a `fixed` child of the panel can resolve against the panel itself).
+      node.style.left = Math.round(pointX) + 'px'
+      node.style.top = Math.round(pointY) + 'px'
+      node.style.maxHeight = Math.max(120, Math.floor(bounds.bottom - bounds.top)) + 'px'
+      let rect = null
+      try {
+        rect = node.getBoundingClientRect()
+      } catch (error) {
+        rect = null
+      }
+      const width = Math.max(1, Math.round(rect ? rect.width : 0))
+      const height = Math.max(1, Math.round(rect ? rect.height : 0))
+      const offsetX = rect ? rect.left - pointX : 0
+      const offsetY = rect ? rect.top - pointY : 0
+      // 2) Flip to the other side of the pointer when the preferred side overflows.
+      let left = pointX
+      let top = pointY
+      if (left + width > bounds.right) left = pointX - width
+      if (top + height > bounds.bottom) top = pointY - height
+      // 3) Clamp inside the panel.
+      left = Math.max(bounds.left, Math.min(left, bounds.right - width))
+      top = Math.max(bounds.top, Math.min(top, bounds.bottom - height))
+      node.style.left = Math.round(left - offsetX) + 'px'
+      node.style.top = Math.round(top - offsetY) + 'px'
+    }
+
+    /* ------------------------------------------------------------------------------------------
+     * The menu component (registered as an app panel; owns its listener and its CSS)
+     * ---------------------------------------------------------------------------------------- */
+
+    function ContextMenuLayer(props) {
+      const ctx = (props && props.ctx) || {}
+      const ctxRef = React.useRef(ctx)
+      ctxRef.current = ctx
+      // Actions run after the right-click applied its selection, so keep the newest context
+      // reachable from the run-time helpers (`copySelectionAs` reads the live selection).
+      CONTEXT_MENU_STATE.liveCtx = ctx
+      const menuRef = React.useRef(null)
+      const previousFocusRef = React.useRef(null)
+      const activeRef = React.useRef(-1)
+      const selectedState = React.useState(null)
+      const menu = selectedState[0]
+      const setMenu = selectedState[1]
+      const selectedActive = React.useState(-1)
+      const activeIndex = selectedActive[0]
+      const setActiveIndex = selectedActive[1]
+      activeRef.current = activeIndex
+
+      const closeMenu = React.useCallback(function (restoreFocus) {
+        const previous = previousFocusRef.current
+        previousFocusRef.current = null
+        setMenu(null)
+        setActiveIndex(-1)
+        if (restoreFocus === false || !previous) return
+        try {
+          if (previous.isConnected !== false && typeof previous.focus === 'function') {
+            previous.focus({ preventScroll: true })
+          }
+        } catch (error) {
+          try {
+            if (typeof previous.focus === 'function') previous.focus()
+          } catch (ignored) {
+            /* focus restore is best effort */
+          }
+        }
+      }, [])
+
+      const runItem = React.useCallback(
+        function (item) {
+          if (!item || item.separator || item.disabled || typeof item.run !== 'function') return
+          const run = item.run
+          closeMenu(true)
+          let outcome = null
+          try {
+            outcome = run()
+          } catch (error) {
+            contextMenuReport(ctxRef.current, CONTEXT_MENU_COPY.actionFailed + ': ' + shortError(error))
+            return
+          }
+          if (outcome && typeof outcome.catch === 'function') {
+            outcome.catch(function (error) {
+              contextMenuReport(ctxRef.current, CONTEXT_MENU_COPY.actionFailed + ': ' + shortError(error))
+            })
+          }
+        },
+        [closeMenu],
+      )
+
+      /** Resolve the target, apply click-selection semantics and open the menu at the pointer. */
+      const openMenu = React.useCallback(function (currentCtx, info, event) {
+        const editor = (currentCtx && currentCtx.editor) || {}
+        const selectedIds = Array.isArray(editor.selectedLayerIds) ? editor.selectedLayerIds.slice() : []
+        let selectionIds = selectedIds
+        if (info.kind === 'layer') {
+          if (selectedIds.indexOf(info.layerId) < 0) {
+            // Right-click on an unselected object selects it first (single-click semantics);
+            // right-click inside a multi-selection keeps the whole selection.
+            selectionIds = [info.layerId]
+            if (typeof editor.selectLayer === 'function') editor.selectLayer(info.layerId, info.artboardId || null)
+          }
+        } else if (info.kind === 'artboard') {
+          if (editor.selectedArtboardId !== info.artboardId && typeof editor.selectArtboard === 'function') {
+            editor.selectArtboard(info.artboardId)
+          }
+        }
+        const model = contextMenuBuildMenu(currentCtx, Object.assign({}, info, { selectionIds: selectionIds }))
+        if (!model || !model.items.length) return
+        previousFocusRef.current =
+          typeof document !== 'undefined' ? document.activeElement : null
+        setActiveIndex(-1)
+        setMenu({
+          x: Math.round(finiteNumber(event.clientX, 0)),
+          y: Math.round(finiteNumber(event.clientY, 0)),
+          label: model.label,
+          heading: model.heading,
+          items: model.items,
+          target: info,
+        })
+        beacon('context-menu', { target: model.beaconTarget, items: model.beaconItems })
+      }, [])
+
+      // ONE `contextmenu` listener for the whole panel: capture phase, so the surface's own
+      // right-click handling (and the host app menu) never fires inside the canvas.
+      React.useEffect(
+        function () {
+          function onContextMenu(event) {
+            if (!event || !event.target) return
+            const currentCtx = ctxRef.current || {}
+            const appNode = contextMenuAppNode(currentCtx)
+            const target = event.target
+            if (appNode) {
+              if (typeof appNode.contains !== 'function' || !appNode.contains(target)) return
+            } else if (!(typeof target.closest === 'function' && target.closest('.dc-app'))) {
+              return
+            }
+            // Text fields keep their native menu (rename / filter inputs).
+            if (contextMenuIsEditableTarget(target)) return
+            const info = contextMenuResolveTarget(target, appNode, currentCtx)
+            if (!info) return
+            if (typeof event.preventDefault === 'function') event.preventDefault()
+            if (typeof event.stopPropagation === 'function') event.stopPropagation()
+            try {
+              openMenu(currentCtx, info, event)
+            } catch (error) {
+              beacon('context-menu-failed', { message: shortError(error) })
+            }
+          }
+          document.addEventListener('contextmenu', onContextMenu, true)
+          return function () {
+            document.removeEventListener('contextmenu', onContextMenu, true)
+          }
+        },
+        [openMenu],
+      )
+
+      // While open: close on outside pointerdown / Escape / wheel / scroll / blur / resize.
+      React.useEffect(
+        function () {
+          if (!menu) return undefined
+          function targetInside(event) {
+            const node = menuRef.current
+            const target = event ? event.target : null
+            return !!(node && target && typeof node.contains === 'function' && node.contains(target))
+          }
+          function onPointerDown(event) {
+            if (targetInside(event)) return
+            closeMenu(true)
+          }
+          function onWheel(event) {
+            const node = menuRef.current
+            // Let a long menu scroll its own list instead of closing on the first notch.
+            if (targetInside(event) && node && node.scrollHeight > node.clientHeight + 1) return
+            closeMenu(false)
+          }
+          function onScroll(event) {
+            if (targetInside(event)) return
+            closeMenu(false)
+          }
+          function onKeyDown(event) {
+            if (!event || event.key !== 'Escape') return
+            if (typeof event.preventDefault === 'function') event.preventDefault()
+            if (typeof event.stopPropagation === 'function') event.stopPropagation()
+            closeMenu(true)
+          }
+          function onResize() {
+            closeMenu(false)
+          }
+          function onWindowBlur() {
+            closeMenu(false)
+          }
+          document.addEventListener('pointerdown', onPointerDown, true)
+          document.addEventListener('wheel', onWheel, { capture: true, passive: true })
+          document.addEventListener('scroll', onScroll, true)
+          document.addEventListener('keydown', onKeyDown, true)
+          window.addEventListener('resize', onResize)
+          window.addEventListener('blur', onWindowBlur)
+          return function () {
+            document.removeEventListener('pointerdown', onPointerDown, true)
+            document.removeEventListener('wheel', onWheel, { capture: true, passive: true })
+            document.removeEventListener('scroll', onScroll, true)
+            document.removeEventListener('keydown', onKeyDown, true)
+            window.removeEventListener('resize', onResize)
+            window.removeEventListener('blur', onWindowBlur)
+          }
+        },
+        [menu, closeMenu],
+      )
+
+      // Place before paint (no jump from the raw pointer position) and focus the menu.
+      React.useLayoutEffect(
+        function () {
+          if (!menu) return
+          const node = menuRef.current
+          if (!node) return
+          contextMenuPlaceMenu(node, menu.x, menu.y, contextMenuAppNode(ctxRef.current))
+          try {
+            node.focus({ preventScroll: true })
+          } catch (error) {
+            try {
+              node.focus()
+            } catch (ignored) {
+              /* focus is best effort */
+            }
+          }
+        },
+        [menu],
+      )
+
+      function moveActive(direction, key) {
+        if (!menu) return
+        const items = menu.items
+        const selectable = []
+        for (let index = 0; index < items.length; index += 1) {
+          const item = items[index]
+          if (item && !item.separator && !item.disabled) selectable.push(index)
+        }
+        if (!selectable.length) return
+        let next = -1
+        if (key === 'Home') next = selectable[0]
+        else if (key === 'End') next = selectable[selectable.length - 1]
+        else {
+          const at = selectable.indexOf(activeRef.current)
+          if (at < 0) next = direction > 0 ? selectable[0] : selectable[selectable.length - 1]
+          else next = selectable[(at + direction + selectable.length) % selectable.length]
+        }
+        setActiveIndex(next)
+        const node = menuRef.current
+        const row = node && typeof node.querySelector === 'function' ? node.querySelector('[data-dcm-index="' + next + '"]') : null
+        if (row && typeof row.scrollIntoView === 'function') {
+          try {
+            row.scrollIntoView({ block: 'nearest' })
+          } catch (error) {
+            /* scrolling is best effort */
+          }
+        }
+      }
+
+      function onMenuKeyDown(event) {
+        if (!event || !menu) return
+        const key = event.key
+        if (key === 'Escape' || key === 'Tab') {
+          if (typeof event.preventDefault === 'function') event.preventDefault()
+          if (typeof event.stopPropagation === 'function') event.stopPropagation()
+          closeMenu(true)
+          return
+        }
+        if (key === 'Enter' || key === ' ' || key === 'Spacebar') {
+          if (typeof event.preventDefault === 'function') event.preventDefault()
+          if (typeof event.stopPropagation === 'function') event.stopPropagation()
+          runItem(menu.items[activeRef.current])
+          return
+        }
+        if (key === 'ArrowDown' || key === 'ArrowUp' || key === 'Home' || key === 'End') {
+          if (typeof event.preventDefault === 'function') event.preventDefault()
+          if (typeof event.stopPropagation === 'function') event.stopPropagation()
+          moveActive(key === 'ArrowDown' || key === 'Home' ? 1 : -1, key)
+          return
+        }
+        if (key === 'Shift' || key === 'Control' || key === 'Alt' || key === 'Meta') return
+        // Swallow everything else: nothing may act on the canvas behind an open menu.
+        if (typeof event.stopPropagation === 'function') event.stopPropagation()
+      }
+
+      const styleTag = h('style', {
+        key: 'dcm-style',
+        dangerouslySetInnerHTML: { __html: CONTEXT_MENU_CSS },
+      })
+      if (!menu) return h(React.Fragment, null, styleTag)
+
+      const rows = []
+      if (menu.heading) {
+        rows.push(
+          h(
+            'div',
+            { key: 'head', className: 'dcm-head', role: 'presentation', title: menu.heading },
+            menu.heading,
+          ),
+        )
+      }
+      for (let index = 0; index < menu.items.length; index += 1) {
+        const item = menu.items[index]
+        if (!item) continue
+        if (item.separator) {
+          rows.push(h('div', { key: 'sep-' + index, className: 'dc-menu-sep', role: 'separator' }))
+          continue
+        }
+        const disabled = item.disabled === true
+        const isActive = index === activeIndex
+        const title = disabled
+          ? item.reason || item.label
+          : item.shortcut
+            ? item.label + ' (' + item.shortcut + ')'
+            : item.label
+        rows.push(
+          h(
+            'button',
+            {
+              key: 'item-' + (item.id || index),
+              type: 'button',
+              role: 'menuitem',
+              id: contextMenuItemDomId(item, index),
+              'data-dcm-index': index,
+              className:
+                'dc-menu-item' + (item.danger ? ' dc-danger' : '') + (isActive ? ' dcm-active' : ''),
+              'aria-disabled': disabled ? 'true' : 'false',
+              tabIndex: -1,
+              title: title,
+              onPointerEnter: function () {
+                if (!disabled) setActiveIndex(index)
+              },
+              onClick: function (event) {
+                if (typeof event.preventDefault === 'function') event.preventDefault()
+                if (typeof event.stopPropagation === 'function') event.stopPropagation()
+                runItem(item)
+              },
+            },
+            h('span', { className: 'dc-menu-item-icon' }, h(ContextMenuGlyph, { name: item.icon, size: 14 })),
+            h('span', { className: 'dc-menu-item-label' }, item.label),
+            item.shortcut ? h('span', { className: 'dc-menu-item-hint' }, item.shortcut) : null,
+            item.checked
+              ? h('span', { className: 'dc-menu-item-check' }, h(ContextMenuGlyph, { name: 'check', size: 12 }))
+              : null,
+          ),
+        )
+      }
+      const activeItem = activeIndex >= 0 ? menu.items[activeIndex] : null
+
+      return h(
+        React.Fragment,
+        null,
+        styleTag,
+        h(
+          'div',
+          {
+            className: 'dc-ctxmenu',
+            role: 'menu',
+            'aria-label': menu.label,
+            ref: menuRef,
+            tabIndex: -1,
+            'aria-activedescendant':
+              activeItem && !activeItem.separator ? contextMenuItemDomId(activeItem, activeIndex) : undefined,
+            style: { left: menu.x + 'px', top: menu.y + 'px' },
+            // Gestures must never start underneath the menu.
+            onPointerDown: function (event) {
+              if (typeof event.stopPropagation === 'function') event.stopPropagation()
+            },
+            onPointerUp: function (event) {
+              if (typeof event.stopPropagation === 'function') event.stopPropagation()
+            },
+            onContextMenu: function (event) {
+              if (typeof event.preventDefault === 'function') event.preventDefault()
+              if (typeof event.stopPropagation === 'function') event.stopPropagation()
+            },
+            onKeyDown: onMenuKeyDown,
+          },
+          rows,
+        ),
+      )
+    }
+
+    registerAppPanel({
+      id: 'context-menu',
+      render: function (ctx) {
+        return h(ContextMenuLayer, { key: 'context-menu', ctx: ctx })
+      },
+    })
+    /* ------------------------------------------------------------------------------------------
+     * Keyboard shortcuts
+     *
+     * One registry for every binding the canvas has (existing and new) plus the discoverable
+     * "Keyboard shortcuts" sheet. Each entry is { id, keys, label, group, run?, when? }, so the
+     * sheet and the handler are the same source of truth: a shortcut that is not in the registry
+     * does not exist.
+     *
+     * Bindings are installed through `registerKeyHandler` (EXTENSIONS.keys), so this part owns the
+     * keymap and the editor does not need to know about individual keys.
+     *
+     * Ownership rules (see CONTRACT.md):
+     *   - an entry WITH `run` is handled here;
+     *   - an entry WITHOUT `run` is documentation only: the editor/shell/selection/comment/export
+     *     part keeps its binding and the sheet still lists it, so there is exactly one owner.
+     * ---------------------------------------------------------------------------------------- */
+
+    const SHORTCUTS_GROUPS = ['Tools', 'Selection', 'Edit', 'Arrange', 'View', 'Panels', 'Comments', 'Export']
+
+    const SHORTCUTS_IS_MAC =
+      typeof navigator !== 'undefined' &&
+      /Mac|iPhone|iPad|iPod/i.test(
+        String(
+          (navigator && (navigator.platform || navigator.userAgent)) || '',
+        ),
+      )
+
+    /** Chord tokens that name a modifier, not a key. */
+    const SHORTCUT_MOD_TOKENS = {
+      'Ctrl/Cmd': 'mod',
+      Mod: 'mod',
+      Ctrl: 'ctrl',
+      Cmd: 'meta',
+      Meta: 'meta',
+      '⌘': 'meta',
+      Shift: 'shift',
+      '⇧': 'shift',
+      Alt: 'alt',
+      Option: 'alt',
+      '⌥': 'alt',
+    }
+
+    /** Named keys: display token -> accepted `event.key` values. */
+    const SHORTCUT_KEY_ALIASES = {
+      Del: ['Delete', 'Del'],
+      Delete: ['Delete', 'Del'],
+      Backspace: ['Backspace'],
+      Esc: ['Escape', 'Esc'],
+      Escape: ['Escape', 'Esc'],
+      Enter: ['Enter'],
+      Return: ['Enter'],
+      Tab: ['Tab'],
+      Space: [' ', 'Spacebar', 'Space'],
+      '↑': ['ArrowUp'],
+      '↓': ['ArrowDown'],
+      '←': ['ArrowLeft'],
+      '→': ['ArrowRight'],
+      Up: ['ArrowUp'],
+      Down: ['ArrowDown'],
+      Left: ['ArrowLeft'],
+      Right: ['ArrowRight'],
+      PageUp: ['PageUp'],
+      PageDown: ['PageDown'],
+      Home: ['Home'],
+      End: ['End'],
+    }
+
+    /** Punctuation keys: display token -> physical `event.code` (layout independent). */
+    const SHORTCUT_CODE_ALIASES = {
+      ']': 'BracketRight',
+      '[': 'BracketLeft',
+      '}': 'BracketRight',
+      '{': 'BracketLeft',
+      '/': 'Slash',
+      '?': 'Slash',
+      '=': 'Equal',
+      '+': 'NumpadAdd',
+      '-': 'Minus',
+      ',': 'Comma',
+      '.': 'Period',
+      ';': 'Semicolon',
+      "'": 'Quote',
+      '`': 'Backquote',
+      '\\': 'Backslash',
+    }
+
+    const SHORTCUT_MOD_LABEL = SHORTCUTS_IS_MAC ? '⌘' : 'Ctrl'
+
+    /** Display labels for the keycaps inside the sheet (platform appropriate). */
+    const SHORTCUT_TOKEN_LABELS = {
+      'Ctrl/Cmd': SHORTCUT_MOD_LABEL,
+      Mod: SHORTCUT_MOD_LABEL,
+      Ctrl: SHORTCUTS_IS_MAC ? '⌃' : 'Ctrl',
+      Cmd: '⌘',
+      Meta: '⌘',
+      Shift: SHORTCUTS_IS_MAC ? '⇧' : 'Shift',
+      Alt: SHORTCUTS_IS_MAC ? '⌥' : 'Alt',
+      Option: SHORTCUTS_IS_MAC ? '⌥' : 'Alt',
+      Del: 'Del',
+      Delete: 'Del',
+      Backspace: SHORTCUTS_IS_MAC ? '⌫' : 'Backspace',
+      Esc: 'Esc',
+      Escape: 'Esc',
+      Enter: SHORTCUTS_IS_MAC ? '↵' : 'Enter',
+      Tab: 'Tab',
+      Space: 'Space',
+      Up: '↑',
+      Down: '↓',
+      Left: '←',
+      Right: '→',
+      drag: 'drag',
+      wheel: 'wheel',
+      click: 'click',
+      doubleClick: 'double-click',
+    }
+
+    /* ------------------------------------------------------------------------------------------
+     * Shared state: open/close is a tiny store so the sheet, the command, the toolbar button and
+     * other parts (context menu) can drive it without a React tree in between.
+     * ---------------------------------------------------------------------------------------- */
+
+    const SHORTCUTS_RUNTIME = {
+      /** Full `useEditor` hook captured from an app-panel render (has everything, not just actions). */
+      editor: null,
+      /** True while the pointer is over the canvas app root (gates single-key tool bindings). */
+      pointerInside: false,
+      /** Keyboard-shortcut sheet open flag (mirrored in SHORTCUTS_UI). */
+      open: false,
+    }
+
+    const SHORTCUTS_UI = {
+      open: false,
+      subscribers: [],
+      subscribe: function (listener) {
+        SHORTCUTS_UI.subscribers.push(listener)
+        return function () {
+          const index = SHORTCUTS_UI.subscribers.indexOf(listener)
+          if (index >= 0) SHORTCUTS_UI.subscribers.splice(index, 1)
+        }
+      },
+      notify: function () {
+        const snapshot = SHORTCUTS_UI.subscribers.slice()
+        for (let index = 0; index < snapshot.length; index += 1) {
+          try {
+            snapshot[index]()
+          } catch (error) {
+            beacon('shortcuts-subscriber-failed', { message: shortError(error) })
+          }
+        }
+      },
+      set: function (patch) {
+        Object.assign(SHORTCUTS_UI, patch)
+        SHORTCUTS_RUNTIME.open = SHORTCUTS_UI.open === true
+        SHORTCUTS_UI.notify()
+      },
+    }
+
+    function openShortcutsSheet() {
+      if (SHORTCUTS_UI.open !== true) {
+        SHORTCUTS_UI.set({ open: true })
+        beacon('shortcuts-open', {})
+      }
+      return true
+    }
+
+    function closeShortcutsSheet() {
+      if (SHORTCUTS_UI.open === true) {
+        SHORTCUTS_UI.set({ open: false })
+        beacon('shortcuts-close', {})
+      }
+      return true
+    }
+
+    function toggleShortcutsSheet() {
+      return SHORTCUTS_UI.open === true ? closeShortcutsSheet() : openShortcutsSheet()
+    }
+
+    /* ------------------------------------------------------------------------------------------
+     * Chord grammar: 'Ctrl/Cmd+Shift+G', 'Alt+1', 'Shift+2', 'Del', '↑'.
+     *
+     * A registry entry's `keys` is a list of alternatives; each alternative is one chord. Parsing
+     * happens once at load (SHORTCUT_SPECS), so matching a keydown is a flat loop over specs and
+     * the handler and the sheet can never drift.
+     * ---------------------------------------------------------------------------------------- */
+
+    function shortcutChordSpec(chord) {
+      const text = String(chord === undefined || chord === null ? '' : chord).trim()
+      if (!text) return null
+      const spec = { mod: false, ctrl: false, meta: false, alt: false, shift: false, key: '', flexShift: false }
+      // Numpad/plus is its own key on every layout: never a modifier chain.
+      if (text === '+') {
+        spec.key = '+'
+        spec.flexShift = true
+        return spec
+      }
+      const parts = text.split('+')
+      if (!parts.length) return null
+      const keyToken = String(parts[parts.length - 1] || '').trim()
+      if (!keyToken) return null
+      for (let index = 0; index < parts.length - 1; index += 1) {
+        const token = String(parts[index] || '').trim()
+        const slot = SHORTCUT_MOD_TOKENS[token]
+        if (!slot) return null
+        spec[slot] = true
+      }
+      spec.key = keyToken
+      return spec
+    }
+
+    function shortcutKeyTokenMatches(event, token) {
+      if (!token) return false
+      const key = typeof event.key === 'string' ? event.key : ''
+      const code = typeof event.code === 'string' ? event.code : ''
+      const alias = SHORTCUT_KEY_ALIASES[token]
+      if (alias && alias.indexOf(key) >= 0) return true
+      const codeAlias = SHORTCUT_CODE_ALIASES[token]
+      if (codeAlias && code === codeAlias) return true
+      if (token.length === 1) {
+        // Physical fallback keeps single-key tools working on non-Latin layouts.
+        if (/[A-Za-z]/.test(token) && code === 'Key' + token.toUpperCase()) return true
+        if (/[0-9]/.test(token) && code === 'Digit' + token) return true
+        if (key === token) return true
+        if (key.length === 1 && key.toUpperCase() === token.toUpperCase() && /[A-Za-z0-9]/.test(token)) {
+          return true
+        }
+        return false
+      }
+      return key === token
+    }
+
+    function shortcutSpecMatches(spec, event) {
+      if (!spec || !event) return false
+      const wantCtrl = spec.ctrl === true || (spec.mod === true && !SHORTCUTS_IS_MAC)
+      const wantMeta = spec.meta === true || (spec.mod === true && SHORTCUTS_IS_MAC)
+      if ((event.ctrlKey === true) !== wantCtrl) return false
+      if ((event.metaKey === true) !== wantMeta) return false
+      if ((event.altKey === true) !== (spec.alt === true)) return false
+      if (!spec.flexShift && (event.shiftKey === true) !== (spec.shift === true)) return false
+      return shortcutKeyTokenMatches(event, spec.key)
+    }
+
+    /* ------------------------------------------------------------------------------------------
+     * The registry. `run(editor, event, api)` returns true only when it acted; `editor` is the full
+     * hook (captured from an app-panel render), `api` is the extension context for the same render.
+     * Entries without `run` are documentation: the owning part keeps the binding.
+     * ---------------------------------------------------------------------------------------- */
+
+    const SHORTCUTS = [
+      /* ------------------------------- Tools ------------------------------- */
+      {
+        id: 'tool-select',
+        group: 'Tools',
+        keys: ['V'],
+        label: 'Select tool',
+        hint: 'Leaves comment mode',
+        run: function (editor, event, api) {
+          if (!shortcutToolGate()) return false
+          const setCommentMode = shortcutMethod(editor, api, 'setCommentMode')
+          if (!setCommentMode) return false
+          setCommentMode(false)
+          return true
+        },
+      },
+      {
+        id: 'tool-rect',
+        group: 'Tools',
+        keys: ['R'],
+        label: 'Rectangle',
+        run: function (editor, event, api) {
+          return shortcutCreateLayer(editor, api, 'rect')
+        },
+      },
+      {
+        id: 'tool-ellipse',
+        group: 'Tools',
+        keys: ['O'],
+        label: 'Ellipse',
+        run: function (editor, event, api) {
+          return shortcutCreateLayer(editor, api, 'ellipse')
+        },
+      },
+      {
+        id: 'tool-text',
+        group: 'Tools',
+        keys: ['T'],
+        label: 'Text',
+        run: function (editor, event, api) {
+          return shortcutCreateLayer(editor, api, 'text')
+        },
+      },
+      {
+        id: 'tool-frame',
+        group: 'Tools',
+        keys: ['F'],
+        label: 'Frame',
+        run: function (editor, event, api) {
+          return shortcutCreateLayer(editor, api, 'frame')
+        },
+      },
+      {
+        id: 'tool-line',
+        group: 'Tools',
+        keys: ['L'],
+        label: 'Line',
+        run: function (editor, event, api) {
+          return shortcutCreateLayer(editor, api, 'line')
+        },
+      },
+      {
+        id: 'tool-button',
+        group: 'Tools',
+        keys: ['B'],
+        label: 'Button preset',
+        run: function (editor, event, api) {
+          if (!shortcutToolGate()) return false
+          const addButtonPreset = shortcutMethod(editor, api, 'addButtonPreset')
+          if (!addButtonPreset) return false
+          addButtonPreset()
+          return true
+        },
+      },
+      {
+        id: 'tool-image',
+        group: 'Tools',
+        keys: ['I'],
+        label: 'Image…',
+        run: function (editor, event, api) {
+          if (!shortcutToolGate()) return false
+          const openImagePicker = shortcutMethod(editor, api, 'openImagePicker')
+          if (!openImagePicker) return false
+          openImagePicker('toolbar')
+          return true
+        },
+      },
+
+      /* ------------------------------- Selection ------------------------------- */
+      {
+        id: 'select-all',
+        group: 'Selection',
+        keys: ['Ctrl/Cmd+A'],
+        label: 'Select all layers',
+        owner: 'Editor',
+      },
+      {
+        id: 'select-next-sibling',
+        group: 'Selection',
+        keys: ['Tab'],
+        label: 'Select next layer',
+        run: function (editor, event, api) {
+          if (!shortcutToolGate()) return false
+          if (shortcutIsControlTarget(event && event.target)) return false
+          return shortcutCycleSibling(editor, api, 1)
+        },
+      },
+      {
+        id: 'select-prev-sibling',
+        group: 'Selection',
+        keys: ['Shift+Tab'],
+        label: 'Select previous layer',
+        run: function (editor, event, api) {
+          if (!shortcutToolGate()) return false
+          if (shortcutIsControlTarget(event && event.target)) return false
+          return shortcutCycleSibling(editor, api, -1)
+        },
+      },
+      {
+        id: 'select-parent',
+        group: 'Selection',
+        keys: ['Ctrl/Cmd+Enter'],
+        label: 'Select parent',
+        run: function (editor, event, api) {
+          if (!shortcutFocusInside()) return false
+          return shortcutSelectParent(editor, api)
+        },
+      },
+      {
+        id: 'drill-in',
+        group: 'Selection',
+        keys: ['Enter'],
+        label: 'Enter group or frame',
+        owner: 'Editor',
+      },
+      {
+        id: 'step-out',
+        group: 'Selection',
+        keys: ['Esc'],
+        label: 'Deselect / leave group',
+        run: function () {
+          // The sheet owns Esc while it is open; every other Esc stays with the editor.
+          if (SHORTCUTS_UI.open === true) {
+            closeShortcutsSheet()
+            return true
+          }
+          return false
+        },
+      },
+      {
+        id: 'lock-selection',
+        group: 'Selection',
+        keys: ['Ctrl/Cmd+Shift+L'],
+        label: 'Lock / unlock selection',
+        run: function (editor, event, api) {
+          if (!shortcutFocusInside()) return false
+          const selection = shortcutSelection(api, editor)
+          if (!selection.layerIds.length) return false
+          const toggleLock = shortcutMethod(editor, api, 'toggleLock')
+          if (!toggleLock) return false
+          toggleLock()
+          return true
+        },
+      },
+      {
+        id: 'hide-selection',
+        group: 'Selection',
+        keys: ['Alt+Shift+H'],
+        label: 'Hide / show layer',
+        run: function (editor, event, api) {
+          if (!shortcutFocusInside()) return false
+          const selection = shortcutSelection(api, editor)
+          if (!selection.primaryLayerId) return false
+          const toggleVisible = shortcutMethod(editor, api, 'toggleVisible')
+          if (!toggleVisible) return false
+          toggleVisible(selection.primaryLayerId)
+          return true
+        },
+      },
+      {
+        id: 'nudge-small',
+        group: 'Selection',
+        keys: ['↑', '↓', '←', '→'],
+        label: 'Nudge 1 px',
+        owner: 'Editor',
+      },
+      {
+        id: 'nudge-large',
+        group: 'Selection',
+        keys: ['Shift+↑', 'Shift+↓', 'Shift+←', 'Shift+→'],
+        label: 'Nudge 10 px',
+        owner: 'Editor',
+      },
+      {
+        id: 'comment-on-layer',
+        group: 'Selection',
+        keys: ['Ctrl/Cmd+Enter'],
+        label: 'Send a comment (while typing)',
+        owner: 'Composer',
+      },
+
+      /* ------------------------------- Edit ------------------------------- */
+      {
+        id: 'undo',
+        group: 'Edit',
+        keys: ['Ctrl/Cmd+Z'],
+        label: 'Undo',
+        owner: 'Editor',
+      },
+      {
+        id: 'redo',
+        group: 'Edit',
+        keys: ['Ctrl/Cmd+Shift+Z'],
+        label: 'Redo',
+        owner: 'Editor',
+      },
+      {
+        id: 'redo-alt',
+        group: 'Edit',
+        keys: ['Ctrl/Cmd+Y'],
+        label: 'Redo (alternative)',
+        owner: 'Editor',
+      },
+      {
+        id: 'duplicate',
+        group: 'Edit',
+        keys: ['Ctrl/Cmd+D'],
+        label: 'Duplicate selection',
+        owner: 'Editor',
+      },
+      {
+        id: 'copy',
+        group: 'Edit',
+        keys: ['Ctrl/Cmd+C'],
+        label: 'Copy',
+        owner: 'Editor',
+      },
+      {
+        id: 'cut',
+        group: 'Edit',
+        keys: ['Ctrl/Cmd+X'],
+        label: 'Cut',
+        owner: 'Editor',
+      },
+      {
+        id: 'paste',
+        group: 'Edit',
+        keys: ['Ctrl/Cmd+V'],
+        label: 'Paste',
+        owner: 'Editor',
+      },
+      {
+        id: 'delete-selection',
+        group: 'Edit',
+        keys: ['Delete', 'Backspace'],
+        label: 'Delete selection or artboard',
+        hint: 'Layers are deleted by the editor; an artboard-only selection is deleted here',
+        run: function (editor, event, api) {
+          if (!shortcutFocusInside()) return false
+          const selection = shortcutSelection(api, editor)
+          if (selection.layerIds.length) return false
+          if (!selection.artboardId) return false
+          return shortcutDeleteArtboard(editor, api)
+        },
+      },
+      {
+        id: 'delete-artboard',
+        group: 'Edit',
+        keys: ['Ctrl/Cmd+Shift+Backspace'],
+        label: 'Delete artboard',
+        run: function (editor, event, api) {
+          if (!shortcutFocusInside()) return false
+          return shortcutDeleteArtboard(editor, api)
+        },
+      },
+
+      /* ------------------------------- Arrange ------------------------------- */
+      {
+        id: 'group',
+        group: 'Arrange',
+        keys: ['Ctrl/Cmd+G'],
+        label: 'Group selection',
+        owner: 'Editor',
+      },
+      {
+        id: 'ungroup',
+        group: 'Arrange',
+        keys: ['Ctrl/Cmd+Shift+G'],
+        label: 'Ungroup',
+        owner: 'Editor',
+      },
+      {
+        id: 'bring-forward',
+        group: 'Arrange',
+        keys: ['Ctrl/Cmd+]'],
+        label: 'Bring forward',
+        owner: 'Editor',
+      },
+      {
+        id: 'send-backward',
+        group: 'Arrange',
+        keys: ['Ctrl/Cmd+['],
+        label: 'Send backward',
+        owner: 'Editor',
+      },
+      {
+        id: 'bring-front',
+        group: 'Arrange',
+        keys: ['Ctrl/Cmd+Shift+]'],
+        label: 'Bring to front',
+        owner: 'Editor',
+      },
+      {
+        id: 'send-back',
+        group: 'Arrange',
+        keys: ['Ctrl/Cmd+Shift+['],
+        label: 'Send to back',
+        owner: 'Editor',
+      },
+      {
+        id: 'align-selection',
+        group: 'Arrange',
+        keys: ['Ctrl/Cmd+Shift+←', 'Ctrl/Cmd+Shift+→', 'Ctrl/Cmd+Shift+↑', 'Ctrl/Cmd+Shift+↓'],
+        label: 'Align selection',
+        owner: 'Selection bar',
+      },
+      {
+        id: 'distribute-horizontal',
+        group: 'Arrange',
+        keys: ['Ctrl/Cmd+Shift+H'],
+        label: 'Distribute horizontally',
+        owner: 'Selection bar',
+      },
+      {
+        id: 'distribute-vertical',
+        group: 'Arrange',
+        keys: ['Ctrl/Cmd+Shift+V'],
+        label: 'Distribute vertically',
+        owner: 'Selection bar',
+      },
+
+      /* ------------------------------- View ------------------------------- */
+      {
+        id: 'zoom-100',
+        group: 'View',
+        keys: ['Ctrl/Cmd+0'],
+        label: 'Zoom to 100%',
+        run: function (editor, event, api) {
+          if (!shortcutFocusInside()) return false
+          const camera = shortcutCamera(editor, api)
+          if (!camera) return false
+          return shortcutZoomBy(editor, api, 1 - camera.zoom, true)
+        },
+      },
+      {
+        id: 'zoom-fit',
+        group: 'View',
+        keys: ['Ctrl/Cmd+1'],
+        label: 'Fit artboards',
+        run: function (editor, event, api) {
+          if (!shortcutFocusInside()) return false
+          const fitCamera = shortcutMethod(editor, api, 'fitCamera')
+          if (!fitCamera) return false
+          fitCamera()
+          return true
+        },
+      },
+      {
+        id: 'zoom-fit-selection',
+        group: 'View',
+        keys: ['Ctrl/Cmd+2'],
+        label: 'Fit selection',
+        run: function (editor, event, api) {
+          if (!shortcutFocusInside()) return false
+          return shortcutFitSelection(editor, api)
+        },
+      },
+      {
+        id: 'zoom-in',
+        group: 'View',
+        keys: ['=', '+'],
+        label: 'Zoom in',
+        run: function (editor, event, api) {
+          if (!shortcutFocusInside()) return false
+          return shortcutZoomBy(editor, api, ZOOM_STEP, true)
+        },
+      },
+      {
+        id: 'zoom-out',
+        group: 'View',
+        keys: ['-'],
+        label: 'Zoom out',
+        run: function (editor, event, api) {
+          if (!shortcutFocusInside()) return false
+          return shortcutZoomBy(editor, api, -ZOOM_STEP, true)
+        },
+      },
+      {
+        id: 'fit-all-shell',
+        group: 'View',
+        keys: ['Shift+1'],
+        label: 'Fit artboards',
+        owner: 'Shell',
+      },
+      {
+        id: 'fit-selection-shell',
+        group: 'View',
+        keys: ['Shift+2'],
+        label: 'Fit selection',
+        owner: 'Shell',
+      },
+      {
+        id: 'pan-canvas',
+        group: 'View',
+        keys: ['Space+drag'],
+        label: 'Pan the canvas',
+        owner: 'Editor',
+      },
+      {
+        id: 'zoom-wheel',
+        group: 'View',
+        keys: ['Ctrl/Cmd+wheel'],
+        label: 'Zoom with the wheel',
+        owner: 'Editor',
+      },
+
+      /* ------------------------------- Panels ------------------------------- */
+      {
+        id: 'toggle-layers-panel',
+        group: 'Panels',
+        keys: ['Alt+1'],
+        label: 'Layers panel',
+        run: function (editor, event, api) {
+          if (!shortcutFocusInside()) return false
+          return shortcutTogglePanel(editor, api, 'treeOpen', 'setTreeOpen')
+        },
+      },
+      {
+        id: 'toggle-inspector-panel',
+        group: 'Panels',
+        keys: ['Alt+2'],
+        label: 'Inspector panel',
+        run: function (editor, event, api) {
+          if (!shortcutFocusInside()) return false
+          return shortcutTogglePanel(editor, api, 'inspectorOpen', 'setInspectorOpen')
+        },
+      },
+      {
+        id: 'toggle-export-dialog',
+        group: 'Panels',
+        keys: ['Alt+3'],
+        label: 'Export dialog',
+        run: function (editor, event, api) {
+          if (!shortcutFocusInside()) return false
+          if (typeof openExportDialog !== 'function') return false
+          const isOpen = typeof EXPORT_UI === 'object' && EXPORT_UI !== null && EXPORT_UI.open === true
+          if (isOpen && typeof closeExportDialog === 'function') closeExportDialog()
+          else openExportDialog()
+          return true
+        },
+      },
+      {
+        id: 'toggle-comments-panel',
+        group: 'Panels',
+        keys: ['Alt+C'],
+        label: 'Comments panel',
+        owner: 'Comments panel',
+      },
+      {
+        id: 'shortcuts-sheet',
+        group: 'Panels',
+        keys: ['Shift+/'],
+        label: 'Keyboard shortcuts',
+        hint: 'Opens this sheet',
+        run: function () {
+          if (!shortcutFocusInside()) return false
+          openShortcutsSheet()
+          return true
+        },
+      },
+
+      /* ------------------------------- Comments ------------------------------- */
+      {
+        id: 'comment-mode',
+        group: 'Comments',
+        keys: ['C'],
+        label: 'Comment mode',
+        hint: 'On: click a layer to comment. With a layer selected it also opens its composer',
+        run: function (editor, event, api) {
+          if (!shortcutToolGate()) return false
+          const setCommentMode = shortcutMethod(editor, api, 'setCommentMode')
+          if (!setCommentMode) return false
+          const current =
+            typeof editor.commentMode === 'boolean' ? editor.commentMode : shortcutValue(api, 'commentMode')
+          const next = current !== true
+          setCommentMode(next)
+          if (next) {
+            const selection = shortcutSelection(api, editor)
+            const openComposerFor = shortcutMethod(editor, api, 'openComposerFor')
+            if (selection.primaryLayerId && openComposerFor) {
+              openComposerFor(selection.primaryLayerId, selection.artboardId || null)
+            }
+          }
+          return true
+        },
+      },
+      {
+        id: 'send-comment',
+        group: 'Comments',
+        keys: ['Ctrl/Cmd+Enter'],
+        label: 'Send the comment (while typing)',
+        owner: 'Composer',
+      },
+      {
+        id: 'cancel-comment',
+        group: 'Comments',
+        keys: ['Esc'],
+        label: 'Cancel the comment (while typing)',
+        owner: 'Composer',
+      },
+
+      /* ------------------------------- Export ------------------------------- */
+      {
+        id: 'export-dialog',
+        group: 'Export',
+        keys: ['Ctrl/Cmd+Shift+E'],
+        label: 'Export dialog',
+        owner: 'Export',
+      },
+    ]
+
+    /* ------------------------------------------------------------------------------------------
+     * Compiled specs: one matcher table built from the registry, platform aware.
+     * ---------------------------------------------------------------------------------------- */
+
+    const SHORTCUT_SPECS = []
+
+    function shortcutCompileSpecs() {
+      for (let index = 0; index < SHORTCUTS.length; index += 1) {
+        const entry = SHORTCUTS[index]
+        if (!entry || typeof entry.run !== 'function') continue
+        const keys = SHORTCUTS_IS_MAC && Array.isArray(entry.mac) && entry.mac.length ? entry.mac : entry.keys
+        const list = Array.isArray(keys) ? keys : [keys]
+        for (let scan = 0; scan < list.length; scan += 1) {
+          const spec = shortcutChordSpec(list[scan])
+          if (!spec) continue
+          SHORTCUT_SPECS.push({ entry: entry, spec: spec })
+        }
+      }
+    }
+
+    shortcutCompileSpecs()
+
+    function shortcutFindEntry(event) {
+      if (!event) return null
+      const key = typeof event.key === 'string' ? event.key : ''
+      if (!key && typeof event.code !== 'string') return null
+      for (let index = 0; index < SHORTCUT_SPECS.length; index += 1) {
+        const item = SHORTCUT_SPECS[index]
+        if (shortcutSpecMatches(item.spec, event)) return item.entry
+      }
+      return null
+    }
+
+    /* ------------------------------------------------------------------------------------------
+     * Host resolution: the full editor hook (captured from an app-panel render) with the
+     * extension context as a fallback, so this part works before its own overlay mounts.
+     * ---------------------------------------------------------------------------------------- */
+
+    function shortcutHost(api) {
+      if (SHORTCUTS_RUNTIME.editor) return SHORTCUTS_RUNTIME.editor
+      if (api && api.editor) return api.editor
+      return api || null
+    }
+
+    /**
+     * Method lookup. The captured hook comes first on purpose: the editor's own keydown effect
+     * closes over the extension context of its FIRST render, so `api` values (camera, selection)
+     * are stale snapshots. The hook captured from a panel render is refreshed every render.
+     */
+    function shortcutMethod(editor, api, name) {
+      const sources = [SHORTCUTS_RUNTIME.editor, editor, api, api && api.editor]
+      for (let index = 0; index < sources.length; index += 1) {
+        const source = sources[index]
+        if (source && typeof source[name] === 'function') return source[name]
+      }
+      return null
+    }
+
+    function shortcutValue(api, name) {
+      // Same reasoning as shortcutMethod: never trust the keydown closure's snapshot first.
+      const sources = [SHORTCUTS_RUNTIME.editor, api && api.editor, api]
+      for (let index = 0; index < sources.length; index += 1) {
+        const source = sources[index]
+        if (source && source[name] !== undefined && source[name] !== null) return source[name]
+      }
+      return undefined
+    }
+
+    /** The live camera: cameraRef is updated synchronously, the state value is one commit behind. */
+    function shortcutCamera(editor, api) {
+      const ref = editor && editor.cameraRef
+      if (ref && ref.current && typeof ref.current.zoom === 'number') return ref.current
+      const camera = shortcutValue(api, 'camera')
+      return camera && typeof camera.zoom === 'number' ? camera : null
+    }
+
+    function shortcutAppRoot() {
+      try {
+        return typeof document !== 'undefined' ? document.querySelector('.dc-app') : null
+      } catch (error) {
+        return null
+      }
+    }
+
+    /** Focus or pointer inside the canvas panel; the panel must be the active surface. */
+    function shortcutFocusInside() {
+      const root = shortcutAppRoot()
+      if (!root) return false
+      const active = typeof document !== 'undefined' ? document.activeElement : null
+      if (active && active !== document.body && active !== document.documentElement) {
+        try {
+          if (typeof root.contains === 'function' && root.contains(active)) return true
+        } catch (error) {
+          /* fall through to the pointer check */
+        }
+      }
+      if (SHORTCUTS_RUNTIME.pointerInside === true) return true
+      try {
+        if (typeof root.matches === 'function' && root.matches(':hover')) return true
+      } catch (error) {
+        /* :hover matching is unavailable in a few engines */
+      }
+      return false
+    }
+
+    /** An open dialog (export, shortcuts sheet, …) blocks creation keys but not view/panel keys. */
+    function shortcutModalOpen() {
+      const root = shortcutAppRoot()
+      if (!root) return false
+      try {
+        return !!root.querySelector('[role="dialog"]')
+      } catch (error) {
+        return false
+      }
+    }
+
+    function shortcutToolGate() {
+      return shortcutFocusInside() && !shortcutModalOpen()
+    }
+
+    function shortcutIsTypingTarget(target) {
+      if (!target) return false
+      const tag = String(target.tagName || '').toUpperCase()
+      return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || target.isContentEditable === true
+    }
+
+    function shortcutIsControlTarget(target) {
+      if (!target) return false
+      const tag = String(target.tagName || '').toUpperCase()
+      return tag === 'BUTTON' || tag === 'A' || tag === 'SELECT'
+    }
+
+    function shortcutSelection(api, editor) {
+      // `editor` is the captured (fresh) hook when available; `api` may be a first-render snapshot.
+      const primary = editor || api || {}
+      const fallback = api || {}
+      const primarySelection = primary.selection || fallback.selection || {}
+      const fallbackSelection = fallback.selection || {}
+      const layerIds = Array.isArray(primary.selectedLayerIds)
+        ? primary.selectedLayerIds.slice()
+        : Array.isArray(primarySelection.layerIds)
+          ? primarySelection.layerIds.slice()
+          : Array.isArray(fallback.selectedLayerIds)
+            ? fallback.selectedLayerIds.slice()
+            : Array.isArray(fallbackSelection.layerIds)
+              ? fallbackSelection.layerIds.slice()
+              : []
+      const primaryLayerId =
+        primary.selectedLayerId || primarySelection.primaryLayerId || fallback.selectedLayerId || null
+      const artboardId =
+        primary.selectedArtboardId || primarySelection.artboardId || fallback.selectedArtboardId || null
+      return { layerIds: layerIds, primaryLayerId: primaryLayerId, artboardId: artboardId }
+    }
+
+    function shortcutTree(api, editor) {
+      return shortcutValue(api, 'tree') || (editor && editor.tree) || null
+    }
+
+    function shortcutCreateLayer(editor, api, type) {
+      if (!shortcutToolGate()) return false
+      const addLayer = shortcutMethod(editor, api, 'addLayer')
+      if (!addLayer) return false
+      addLayer(type)
+      return true
+    }
+
+    function shortcutZoomBy(editor, api, delta, claimAlways) {
+      const zoomCameraBy = shortcutMethod(editor, api, 'zoomCameraBy')
+      if (!zoomCameraBy) return false
+      if (!delta && claimAlways !== true) return false
+      zoomCameraBy(delta)
+      return true
+    }
+
+    function shortcutTogglePanel(editor, api, flag, setterName) {
+      const setOpen = shortcutMethod(editor, api, setterName)
+      if (!setOpen) return false
+      let current = typeof editor[flag] === 'boolean' ? editor[flag] : shortcutValue(api, flag)
+      if (typeof current !== 'boolean') {
+        // DOM fallback: the shell renders .dc-left / .dc-right while the panel is visible.
+        try {
+          current = !!document.querySelector(flag === 'treeOpen' ? '.dc-app .dc-left' : '.dc-app .dc-right')
+        } catch (error) {
+          return false
+        }
+      }
+      setOpen(!current)
+      return true
+    }
+
+    function shortcutSiblings(editor, api, node, tree) {
+      const siblingNodesOf = shortcutMethod(editor, api, 'siblingNodesOf')
+      if (siblingNodesOf) {
+        const list = siblingNodesOf(node)
+        if (Array.isArray(list) && list.length) return list
+      }
+      if (node && node.parent && Array.isArray(node.parent.children)) return node.parent.children
+      if (node && node.artboard && tree && Array.isArray(tree.artboards)) {
+        for (let index = 0; index < tree.artboards.length; index += 1) {
+          const entry = tree.artboards[index]
+          if (entry && entry.artboard && entry.artboard.id === node.artboard.id) {
+            return Array.isArray(entry.layers) ? entry.layers : []
+          }
+        }
+      }
+      return []
+    }
+
+    function shortcutCycleSibling(editor, api, direction) {
+      const selection = shortcutSelection(api, editor)
+      if (!selection.primaryLayerId) return false
+      const tree = shortcutTree(api, editor)
+      if (!tree || !tree.byId || typeof tree.byId.get !== 'function') return false
+      const node = tree.byId.get(selection.primaryLayerId)
+      if (!node) return false
+      const siblings = shortcutSiblings(editor, api, node, tree)
+      if (siblings.length < 2) return false
+      let index = -1
+      for (let scan = 0; scan < siblings.length; scan += 1) {
+        if (siblings[scan] && siblings[scan].id === node.id) index = scan
+      }
+      if (index < 0) return false
+      const next = siblings[(index + direction + siblings.length) % siblings.length]
+      if (!next || !next.id) return false
+      const selectLayer = shortcutMethod(editor, api, 'selectLayer')
+      if (!selectLayer) return false
+      selectLayer(next.id, (next.artboard && next.artboard.id) || selection.artboardId || null)
+      return true
+    }
+
+    function shortcutSelectParent(editor, api) {
+      const selection = shortcutSelection(api, editor)
+      const tree = shortcutTree(api, editor)
+      const selectLayer = shortcutMethod(editor, api, 'selectLayer')
+      const node =
+        selection.primaryLayerId && tree && tree.byId && typeof tree.byId.get === 'function'
+          ? tree.byId.get(selection.primaryLayerId) || null
+          : null
+      if (node && node.parent && selectLayer) {
+        selectLayer(node.parent.id, (node.artboard && node.artboard.id) || selection.artboardId || null)
+        return true
+      }
+      // A top-level layer's parent is the artboard itself.
+      const selectArtboard = shortcutMethod(editor, api, 'selectArtboard')
+      if (node && node.artboard && node.artboard.id && selectArtboard) {
+        selectArtboard(node.artboard.id)
+        return true
+      }
+      const drillId =
+        editor && typeof editor.drillGroupId === 'string'
+          ? editor.drillGroupId
+          : shortcutValue(api, 'drillGroupId')
+      if (drillId && selectLayer) {
+        selectLayer(drillId, selection.artboardId || null)
+        return true
+      }
+      const stepSelectionOut = shortcutMethod(editor, api, 'stepSelectionOut')
+      if (stepSelectionOut) return stepSelectionOut() === true
+      return false
+    }
+
+    function shortcutFitSelection(editor, api) {
+      const fitSelection = shortcutMethod(editor, api, 'fitSelection')
+      if (fitSelection) {
+        fitSelection()
+        return true
+      }
+      const fitCamera = shortcutMethod(editor, api, 'fitCamera')
+      const node = shortcutValue(api, 'selectedNode')
+      const layout = shortcutValue(api, 'layout')
+      const canvasViewport = shortcutMethod(editor, api, 'canvasViewport')
+      const setCamera = shortcutMethod(editor, api, 'setCameraValue')
+      if (!node || !layout || !layout.entryById || !canvasViewport || !setCamera) {
+        if (fitCamera) {
+          fitCamera()
+          return true
+        }
+        return false
+      }
+      const entry = layout.entryById.get(node.artboard && node.artboard.id)
+      if (!entry || !node.worldRect) {
+        if (fitCamera) {
+          fitCamera()
+          return true
+        }
+        return false
+      }
+      const viewport = canvasViewport()
+      if (!viewport || viewport.width < 40 || viewport.height < 40) return false
+      const width = Math.max(1, finiteNumber(node.worldRect.width, 1))
+      const height = Math.max(1, finiteNumber(node.worldRect.height, 1))
+      const padding = Math.min(FIT_PADDING, Math.min(viewport.width, viewport.height) * 0.25)
+      const zoom = clamp(
+        Math.min((viewport.width - padding) / width, (viewport.height - padding) / height),
+        MIN_ZOOM,
+        Math.min(MAX_ZOOM, 2),
+      )
+      const centerX = entry.frameX + node.worldRect.x + width / 2
+      const centerY = entry.frameY + node.worldRect.y + height / 2
+      setCamera({
+        x: Math.round(viewport.width / 2 - centerX * zoom),
+        y: Math.round(viewport.height / 2 - centerY * zoom),
+        zoom: zoom,
+      })
+      return true
+    }
+
+    function shortcutArtboardForSelection(editor, api, selection) {
+      if (selection.artboardId) return selection.artboardId
+      const tree = shortcutTree(api, editor)
+      if (!tree || !tree.byId || !selection.primaryLayerId) return null
+      const node = tree.byId.get(selection.primaryLayerId)
+      return node && node.artboard ? node.artboard.id : null
+    }
+
+    function shortcutDeleteArtboard(editor, api) {
+      const selection = shortcutSelection(api, editor)
+      const artboardId = shortcutArtboardForSelection(editor, api, selection)
+      if (!artboardId) return false
+      const deleteArtboard = shortcutMethod(editor, api, 'deleteArtboard')
+      if (deleteArtboard) {
+        deleteArtboard(artboardId)
+        return true
+      }
+      const runOps = shortcutMethod(editor, api, 'runOps')
+      if (!runOps) return false
+      runOps([{ type: 'artboard.delete', artboardId: artboardId }])
+      const clearSelection = shortcutMethod(editor, api, 'clearSelection')
+      if (clearSelection) clearSelection()
+      return true
+    }
+
+    /* ------------------------------------------------------------------------------------------
+     * The one key handler: match -> run -> preventDefault/stopPropagation when it acted.
+     * ---------------------------------------------------------------------------------------- */
+
+    function shortcutRunEntry(event, api) {
+      const entry = shortcutFindEntry(event)
+      if (!entry || typeof entry.run !== 'function') return false
+      // Typing anywhere (inspector, tree rename, composer, chat) never fires a tool key.
+      if (shortcutIsTypingTarget(event.target)) return false
+      const editor = shortcutHost(api)
+      if (!editor) return false
+      if (typeof entry.enabled === 'function') {
+        try {
+          if (entry.enabled(editor, api) !== true) return false
+        } catch (error) {
+          return false
+        }
+      }
+      let handled = false
+      try {
+        handled = entry.run(editor, event, api) === true
+      } catch (error) {
+        beacon('shortcut-failed', { id: String(entry.id), message: shortError(error) })
+        return false
+      }
+      if (!handled) return false
+      try {
+        if (typeof event.preventDefault === 'function') event.preventDefault()
+        if (typeof event.stopPropagation === 'function') event.stopPropagation()
+      } catch (error) {
+        /* a synthetic event may not expose these */
+      }
+      beacon('shortcut', { id: String(entry.id) })
+      return true
+    }
+
+    registerKeyHandler({
+      id: 'shortcuts-keymap',
+      match: function (event) {
+        return !!shortcutFindEntry(event)
+      },
+      run: function (event, api) {
+        return shortcutRunEntry(event, api)
+      },
+    })
+
+    /* ------------------------------------------------------------------------------------------
+     * The sheet: a real cheatsheet (grouped, filterable, two columns when there is room).
+     * CSS lives here, not in 42-css.js.
+     * ---------------------------------------------------------------------------------------- */
+
+    const SHORTCUTS_CSS = `
+.dc-ks-backdrop { position: absolute; inset: 0; z-index: 80; display: flex; align-items: center; justify-content: center; padding: 12px; background: rgba(15, 17, 21, 0.42); }
+.dc-ks-panel { display: flex; flex-direction: column; width: 100%; max-width: 640px; max-height: 100%; min-height: 0; overflow: hidden; background: var(--dsw-alias-bg-base, #ffffff); color: var(--dsw-alias-label-primary, #111827); border: 1px solid var(--dsw-alias-border-l1, #e5e7eb); border-radius: 12px; box-shadow: 0 20px 56px rgba(15, 23, 42, 0.32); }
+.dc-ks-head { display: flex; align-items: flex-start; gap: 8px; flex: 0 0 auto; padding: 12px 12px 10px 14px; border-bottom: 1px solid var(--dsw-alias-border-l1, #e5e7eb); }
+.dc-ks-head-icon { display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto; width: 24px; height: 24px; margin-top: 1px; border-radius: 6px; background: var(--dsw-alias-bg-layer-2, #f0f0f2); color: var(--dsw-alias-label-secondary, #6b7280); }
+.dc-ks-head-main { display: flex; flex-direction: column; gap: 1px; flex: 1 1 auto; min-width: 0; }
+.dc-ks-title { font-size: 13px; font-weight: 650; letter-spacing: -0.01em; }
+.dc-ks-sub { font-size: 11px; line-height: 1.35; color: var(--dsw-alias-label-secondary, #6b7280); }
+.dc-ks-search { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; height: 30px; margin: 10px 14px 0; padding: 0 8px; border: 1px solid var(--dsw-alias-border-l1, #e5e7eb); border-radius: 7px; background: var(--dsw-alias-bg-layer-1, #f7f7f8); color: var(--dsw-alias-label-secondary, #6b7280); }
+.dc-ks-search:focus-within { border-color: var(--dsw-alias-brand-primary, #3b82f6); }
+.dc-ks-search-icon { display: inline-flex; align-items: center; flex: 0 0 auto; }
+.dc-ks-search-input { flex: 1 1 auto; min-width: 0; height: 100%; padding: 0; border: 0; background: transparent; color: var(--dsw-alias-label-primary, #111827); font: inherit; font-size: 12px; outline: none; }
+.dc-ks-search-input::placeholder { color: var(--dsw-alias-label-secondary, #6b7280); }
+.dc-ks-clear { display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto; width: 18px; height: 18px; padding: 0; border: 0; border-radius: 4px; background: transparent; color: var(--dsw-alias-label-secondary, #6b7280); cursor: pointer; }
+.dc-ks-scroll { flex: 1 1 auto; min-height: 0; overflow: auto; padding: 12px 14px 14px; }
+.dc-ks-columns { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 24px; align-items: start; }
+.dc-ks-group { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.dc-ks-group-title { margin: 0 0 4px; font-size: 10px; font-weight: 650; letter-spacing: 0.08em; text-transform: uppercase; color: var(--dsw-alias-label-secondary, #6b7280); }
+.dc-ks-row { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; min-width: 0; padding: 3px 6px; border-radius: 5px; }
+.dc-ks-label { min-width: 0; font-size: 11.5px; line-height: 1.45; color: var(--dsw-alias-label-primary, #111827); }
+.dc-ks-note { margin-left: 5px; font-size: 9.5px; letter-spacing: 0.02em; color: var(--dsw-alias-label-secondary, #6b7280); opacity: 0.75; white-space: nowrap; }
+.dc-ks-keys { display: inline-flex; align-items: center; gap: 3px; flex: 0 0 auto; }
+.dc-ks-or { flex: 0 0 auto; padding: 0 1px; font-size: 10px; color: var(--dsw-alias-label-secondary, #6b7280); opacity: 0.65; }
+.dc-ks-key { display: inline-flex; align-items: center; justify-content: center; min-width: 18px; height: 19px; padding: 0 5px; border: 1px solid var(--dsw-alias-border-l1, #e5e7eb); border-bottom-width: 2px; border-radius: 5px; background: var(--dsw-alias-bg-layer-1, #f7f7f8); color: var(--dsw-alias-label-secondary, #6b7280); font-family: inherit; font-size: 10.5px; line-height: 1; white-space: nowrap; }
+.dc-ks-empty { padding: 26px 10px 30px; text-align: center; }
+.dc-ks-empty-title { font-size: 12px; font-weight: 550; color: var(--dsw-alias-label-primary, #111827); }
+.dc-ks-empty-sub { margin-top: 4px; font-size: 11px; color: var(--dsw-alias-label-secondary, #6b7280); }
+.dc-ks-foot { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; padding: 8px 14px; border-top: 1px solid var(--dsw-alias-border-l1, #e5e7eb); background: var(--dsw-alias-bg-layer-1, #f7f7f8); font-size: 10.5px; color: var(--dsw-alias-label-secondary, #6b7280); }
+.dc-ks-foot-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dc-ks-foot-key { flex: 0 0 auto; margin-left: auto; display: inline-flex; align-items: center; gap: 4px; }
+.dc-ks-foot-key .dc-ks-key { height: 17px; }
+.dc-spacer { flex: 1 1 auto; min-width: 4px; }
+@container dcpane (max-width: 560px) { .dc-ks-columns { grid-template-columns: minmax(0, 1fr); gap: 10px; } }
+@media (hover: hover) and (pointer: fine) { .dc-ks-row:hover { background: var(--dsw-alias-bg-layer-1, #f7f7f8); } .dc-ks-clear:hover { background: var(--dsw-alias-bg-layer-2, #f0f0f2); } }
+`
+
+    function shortcutChordsOf(entry) {
+      const chords = SHORTCUTS_IS_MAC && Array.isArray(entry.mac) && entry.mac.length ? entry.mac : entry.keys
+      return Array.isArray(chords) ? chords : [chords]
+    }
+
+    function shortcutKeycaps(chord) {
+      const parts = String(chord === undefined || chord === null ? '' : chord)
+        .split('+')
+        .filter(function (token) {
+          return token.length > 0
+        })
+      return parts.map(function (token, index) {
+        return h(
+          'kbd',
+          { className: 'dc-ks-key', key: String(token) + '-' + String(index) },
+          SHORTCUT_TOKEN_LABELS[token] || token,
+        )
+      })
+    }
+
+    function shortcutKeyGroups(entry) {
+      const chords = shortcutChordsOf(entry)
+      const nodes = []
+      for (let index = 0; index < chords.length; index += 1) {
+        if (index > 0) nodes.push(h('span', { className: 'dc-ks-or', key: 'or-' + String(index) }, '/'))
+        nodes.push(h('span', { className: 'dc-ks-keys', key: 'chord-' + String(index) }, shortcutKeycaps(chords[index])))
+      }
+      return nodes
+    }
+
+    /** Everything a search word may match: label, group, owner, hint and the printed keys. */
+    function shortcutSearchIndex(entry) {
+      if (entry.search === undefined) {
+        const pieces = [entry.label, entry.group, entry.owner, entry.hint]
+        const chords = shortcutChordsOf(entry)
+        for (let index = 0; index < chords.length; index += 1) {
+          const chord = String(chords[index] || '')
+          pieces.push(chord)
+          const tokens = chord.split('+')
+          const labels = []
+          for (let scan = 0; scan < tokens.length; scan += 1) {
+            labels.push(SHORTCUT_TOKEN_LABELS[tokens[scan]] || tokens[scan])
+          }
+          pieces.push(labels.join(' '))
+          pieces.push(labels.join(''))
+        }
+        entry.search = pieces
+          .filter(function (piece) {
+            return typeof piece === 'string' && piece
+          })
+          .join(' ')
+          .toLowerCase()
+      }
+      return entry.search
+    }
+
+    function shortcutMatchesQuery(entry, words) {
+      if (!words.length) return true
+      const haystack = shortcutSearchIndex(entry)
+      for (let index = 0; index < words.length; index += 1) {
+        if (haystack.indexOf(words[index]) < 0) return false
+      }
+      return true
+    }
+
+    function ShortcutsSheet(props) {
+      const ctx = props.ctx || {}
+      const strings = ctx.strings || {}
+      const forceState = React.useState(0)
+      const force = forceState[1]
+      const queryState = React.useState('')
+      const query = queryState[0]
+      const setQuery = queryState[1]
+      const inputRef = React.useRef(null)
+      const panelRef = React.useRef(null)
+
+      React.useEffect(function () {
+        return SHORTCUTS_UI.subscribe(function () {
+          force(function (value) {
+            return value + 1
+          })
+        })
+      }, [])
+
+      // Capture the full hook (not just the curated actions) and keep it fresh: run() has no
+      // other way to reach `setCommentMode`, `treeOpen`, `zoomCameraBy`, `siblingNodesOf`, …
+      React.useEffect(function () {
+        const next = (ctx && ctx.editor) || null
+        SHORTCUTS_RUNTIME.editor = next
+        return function () {
+          if (SHORTCUTS_RUNTIME.editor === next) SHORTCUTS_RUNTIME.editor = null
+        }
+      })
+
+      // One pointer listener keeps single-key tools scoped to the canvas panel.
+      React.useEffect(function () {
+        function onPointer(event) {
+          const root = shortcutAppRoot()
+          if (!root) return
+          try {
+            SHORTCUTS_RUNTIME.pointerInside = !!(event.target && root.contains(event.target))
+          } catch (error) {
+            SHORTCUTS_RUNTIME.pointerInside = false
+          }
+        }
+        window.addEventListener('pointermove', onPointer, true)
+        window.addEventListener('pointerdown', onPointer, true)
+        return function () {
+          window.removeEventListener('pointermove', onPointer, true)
+          window.removeEventListener('pointerdown', onPointer, true)
+        }
+      }, [])
+
+      const open = SHORTCUTS_UI.open === true
+
+      // Fresh sheet on every open, focused on the filter so typing narrows immediately.
+      React.useEffect(
+        function () {
+          if (!open) return
+          setQuery('')
+          const node = inputRef.current
+          if (node && typeof node.focus === 'function') {
+            node.focus()
+            if (typeof node.select === 'function') node.select()
+          }
+        },
+        [open],
+      )
+
+      // Esc closes the sheet before any canvas binding sees it (capture phase, even from the
+      // filter input, which the editor's own handler would skip).
+      React.useEffect(
+        function () {
+          if (!open) return undefined
+          function onKey(event) {
+            if (!event || event.key !== 'Escape') return
+            if (typeof event.preventDefault === 'function') event.preventDefault()
+            if (typeof event.stopPropagation === 'function') event.stopPropagation()
+            closeShortcutsSheet()
+          }
+          document.addEventListener('keydown', onKey, true)
+          return function () {
+            document.removeEventListener('keydown', onKey, true)
+          }
+        },
+        [open],
+      )
+
+      if (!open) return null
+
+      const words = query
+        .trim()
+        .toLowerCase()
+        .split(/\s+/)
+        .filter(function (word) {
+          return word.length > 0
+        })
+      const sections = []
+      let visible = 0
+      for (let index = 0; index < SHORTCUTS_GROUPS.length; index += 1) {
+        const title = SHORTCUTS_GROUPS[index]
+        const rows = []
+        for (let scan = 0; scan < SHORTCUTS.length; scan += 1) {
+          const entry = SHORTCUTS[scan]
+          if (!entry || entry.group !== title) continue
+          if (!shortcutMatchesQuery(entry, words)) continue
+          rows.push(entry)
+        }
+        if (!rows.length) continue
+        visible += rows.length
+        sections.push({ title: title, rows: rows })
+      }
+
+      function onBackdropPointerDown(event) {
+        if (event && event.target === event.currentTarget) closeShortcutsSheet()
+      }
+
+      function onPanelKeyDown(event) {
+        if (!event || event.key !== 'Tab') return
+        const panel = panelRef.current
+        if (!panel || typeof panel.querySelectorAll !== 'function') return
+        const nodes = panel.querySelectorAll('input, button')
+        if (!nodes.length) return
+        const first = nodes[0]
+        const last = nodes[nodes.length - 1]
+        const active = document.activeElement
+        const inside = !!active && typeof panel.contains === 'function' && panel.contains(active)
+        if (event.shiftKey) {
+          if (!inside || active === first) {
+            if (typeof event.preventDefault === 'function') event.preventDefault()
+            if (last && typeof last.focus === 'function') last.focus()
+          }
+          return
+        }
+        if (!inside || active === last) {
+          if (typeof event.preventDefault === 'function') event.preventDefault()
+          if (first && typeof first.focus === 'function') first.focus()
+        }
+      }
+
+      return h(
+        'div',
+        { className: 'dc-ks-backdrop', onPointerDown: onBackdropPointerDown },
+        h('style', { dangerouslySetInnerHTML: { __html: SHORTCUTS_CSS } }),
+        h(
+          'div',
+          {
+            className: 'dc-ks-panel',
+            ref: panelRef,
+            role: 'dialog',
+            'aria-modal': 'true',
+            'aria-label': 'Keyboard shortcuts',
+            onKeyDown: onPanelKeyDown,
+          },
+          h(
+            'div',
+            { className: 'dc-ks-head' },
+            h(
+              'span',
+              { className: 'dc-ks-head-icon', 'aria-hidden': 'true' },
+              h(Glyph, { name: 'keyboard', size: 15 }),
+            ),
+            h(
+              'div',
+              { className: 'dc-ks-head-main' },
+              h('span', { className: 'dc-ks-title' }, 'Keyboard shortcuts'),
+              h(
+                'span',
+                { className: 'dc-ks-sub' },
+                'Press ? anywhere in the canvas to open this sheet.',
+              ),
+            ),
+            h(IconButton, {
+              icon: 'close',
+              title: strings.dismiss || 'Close',
+              onClick: closeShortcutsSheet,
+            }),
+          ),
+          h(
+            'div',
+            { className: 'dc-ks-search' },
+            h('span', { className: 'dc-ks-search-icon', 'aria-hidden': 'true' }, h(Glyph, { name: 'search', size: 13 })),
+            h('input', {
+              ref: inputRef,
+              type: 'text',
+              className: 'dc-ks-search-input',
+              value: query,
+              placeholder: 'Filter by name or key…',
+              'aria-label': 'Filter shortcuts',
+              autoComplete: 'off',
+              spellCheck: false,
+              onChange: function (event) {
+                setQuery(event && event.target ? String(event.target.value || '') : '')
+              },
+            }),
+            query
+              ? h(
+                  'button',
+                  {
+                    type: 'button',
+                    className: 'dc-ks-clear',
+                    title: 'Clear the filter',
+                    'aria-label': 'Clear the filter',
+                    onClick: function () {
+                      setQuery('')
+                      const node = inputRef.current
+                      if (node && typeof node.focus === 'function') node.focus()
+                    },
+                  },
+                  h(Glyph, { name: 'close', size: 10 }),
+                )
+              : null,
+          ),
+          h(
+            'div',
+            { className: 'dc-ks-scroll' },
+            visible
+              ? h(
+                  'div',
+                  { className: 'dc-ks-columns' },
+                  sections.map(function (section) {
+                    return h(
+                      'section',
+                      { className: 'dc-ks-group', key: 'group-' + section.title },
+                      h('h3', { className: 'dc-ks-group-title' }, section.title),
+                      section.rows.map(function (entry) {
+                        return h(
+                          'div',
+                          { className: 'dc-ks-row', key: 'row-' + entry.id, title: entry.hint || undefined },
+                          h(
+                            'span',
+                            { className: 'dc-ks-label' },
+                            entry.label,
+                            entry.owner ? h('span', { className: 'dc-ks-note' }, entry.owner) : null,
+                          ),
+                          shortcutKeyGroups(entry),
+                        )
+                      }),
+                    )
+                  }),
+                )
+              : h(
+                  'div',
+                  { className: 'dc-ks-empty' },
+                  h(
+                    'div',
+                    { className: 'dc-ks-empty-title' },
+                    'No shortcut matches “' + query.trim() + '”',
+                  ),
+                  h(
+                    'div',
+                    { className: 'dc-ks-empty-sub' },
+                    'Try a tool (rectangle), an action (undo) or a key (ctrl).',
+                  ),
+                ),
+          ),
+          h(
+            'div',
+            { className: 'dc-ks-foot' },
+            h(
+              'span',
+              { className: 'dc-ks-foot-text' },
+              visible + ' of ' + SHORTCUTS.length + ' shortcuts · work while the canvas panel has focus',
+            ),
+            h(
+              'span',
+              { className: 'dc-ks-foot-key' },
+              h('kbd', { className: 'dc-ks-key' }, 'Esc'),
+              h('span', null, 'close'),
+            ),
+          ),
+        ),
+      )
+    }
+
+    registerAppPanel({
+      id: 'shortcuts-sheet',
+      render: function (ctx) {
+        return h(ShortcutsSheet, { key: 'shortcuts-sheet', ctx: ctx })
+      },
+    })
+
+    /* ------------------------------------------------------------------------------------------
+     * Discoverability: a toolbar button, a command (header "More commands" menu / command
+     * palette) and the `?` binding all open the same sheet.
+     * ---------------------------------------------------------------------------------------- */
+
+    function ShortcutsToolbarButton(props) {
+      return h(ToolButton, {
+        icon: 'keyboard',
+        title: 'Shortcuts',
+        hint: '?',
+        iconOnly: true,
+        className: 'dc-ks-tool',
+        onClick: function () {
+          openShortcutsSheet()
+        },
+      })
+    }
+
+    registerToolbar({
+      id: 'shortcuts-toolbar',
+      render: function (ctx) {
+        return h(ShortcutsToolbarButton, { key: 'shortcuts-toolbar', ctx: ctx })
+      },
+    })
+
+    registerCommand({
+      id: 'shortcuts-sheet',
+      label: 'Keyboard shortcuts…',
+      run: function () {
+        return openShortcutsSheet()
+      },
+    })
+    /* ------------------------------------------------------------------------------------------
+     * Toasts
+     *
+     * Every transient message (the "auto layout positions this layer" hint, locked-layer
+     * refusals, failed ops, copy confirmations) used to render as an inline banner ABOVE the
+     * toolbar, which pushed the whole canvas down mid-interaction. Toasts float over the bottom
+     * of the panel instead: they never move anything, they stack, and they expire on their own.
+     *
+     * The editor still owns the message (`inlineError` / `setInlineError`); this part renders it
+     * as a queue and clears it once the entry is gone, so the same message can fire again later.
+     * ---------------------------------------------------------------------------------------- */
+
+    const TOAST_CSS = `
+.dc-toast-layer { position: absolute; left: 10px; right: 10px; bottom: 10px; z-index: 55; display: flex; flex-direction: column; align-items: center; gap: 6px; pointer-events: none; }
+.dc-toast { display: flex; align-items: flex-start; gap: 8px; max-width: 100%; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--dsw-alias-border-l1, #e5e7eb); background: var(--dsw-alias-bg-overlay, #ffffff); color: var(--dsw-alias-label-primary, #111827); box-shadow: 0 8px 22px rgba(15, 17, 21, 0.18); font-size: 11.5px; line-height: 1.4; pointer-events: auto; }
+.dc-toast-warn { border-color: #f59e0b; }
+.dc-toast-icon { flex: 0 0 auto; display: inline-flex; color: var(--dsw-alias-label-secondary, #6b7280); padding-top: 1px; }
+.dc-toast-warn .dc-toast-icon { color: #b45309; }
+.dc-toast-text { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
+.dc-toast-close { flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; width: 18px; height: 18px; padding: 0; border: none; border-radius: 4px; background: transparent; color: var(--dsw-alias-label-secondary, #6b7280); cursor: pointer; }
+@media (hover: hover) and (pointer: fine) { .dc-toast-close:hover { background: var(--dsw-alias-bg-layer-2, #f3f4f6); color: var(--dsw-alias-label-primary, #111827); } }
+.dc-toast-close:focus-visible { outline: 2px solid var(--dsw-alias-label-primary, #111827); outline-offset: 1px; }
+@media (prefers-reduced-motion: no-preference) {
+  .dc-toast { animation: dc-toast-in 140ms ease-out; }
+  @keyframes dc-toast-in { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+}
+`
+
+    /** Messages that read as refusals get the warn treatment. */
+    function toastLooksLikeWarning(text) {
+      return /cannot|can not|locked|not allowed|refus|failed|could not|unavailable|unknown|invalid/i.test(
+        String(text || ''),
+      )
+    }
+
+    const TOAST_STATE = {
+      entries: [],
+      nextId: 1,
+      /** Longest a toast stays on screen (ms); short messages vanish sooner. */
+      maxAge: 5200,
+    }
+
+    function dismissToast(id) {
+      const index = TOAST_STATE.entries.findIndex(function (entry) {
+        return entry.id === id
+      })
+      if (index >= 0) TOAST_STATE.entries.splice(index, 1)
+    }
+
+    /**
+     * Keep the queue in sync with the editor's `inlineError`. Called during render of the layer,
+     * which is safe because it only appends/removes entries and returns the current list.
+     */
+    function syncToasts(editor) {
+      const message = editor && typeof editor.inlineError === 'string' ? editor.inlineError.trim() : ''
+      if (!message) return TOAST_STATE.entries
+      const last = TOAST_STATE.entries[TOAST_STATE.entries.length - 1]
+      if (last && last.text === message) {
+        last.stamp = Date.now()
+        return TOAST_STATE.entries
+      }
+      TOAST_STATE.entries.push({
+        id: TOAST_STATE.nextId++,
+        text: message.slice(0, 400),
+        stamp: Date.now(),
+        warn: toastLooksLikeWarning(message),
+      })
+      // Never stack more than three; drop the oldest.
+      while (TOAST_STATE.entries.length > 3) TOAST_STATE.entries.shift()
+      return TOAST_STATE.entries
+    }
+
+    function ToastLayer(props) {
+      const ctx = props.ctx || {}
+      const editor = ctx.editor || null
+      const strings = ctx.strings || currentStrings()
+      const [, force] = React.useState(0)
+
+      // Tick while toasts are visible: expire old entries and clear the editor message once the
+      // queue is empty so an identical message can be raised again later.
+      React.useEffect(
+        function () {
+          const timer = setInterval(function () {
+            const now = Date.now()
+            let changed = false
+            for (let index = TOAST_STATE.entries.length - 1; index >= 0; index -= 1) {
+              const entry = TOAST_STATE.entries[index]
+              if (now - entry.stamp > TOAST_STATE.maxAge) {
+                TOAST_STATE.entries.splice(index, 1)
+                changed = true
+              }
+            }
+            if (changed) {
+              if (!TOAST_STATE.entries.length && editor && typeof editor.setInlineError === 'function') {
+                editor.setInlineError('')
+              }
+              force(function (value) {
+                return value + 1
+              })
+            }
+          }, 400)
+          return function () {
+            clearInterval(timer)
+          }
+        },
+        [editor],
+      )
+
+      const entries = syncToasts(editor)
+      if (!entries.length) return null
+      return h(
+        'div',
+        { className: 'dc-toast-layer', role: 'status', 'aria-live': 'polite' },
+        h('style', { dangerouslySetInnerHTML: { __html: TOAST_CSS } }),
+        entries.map(function (entry) {
+          return h(
+            'div',
+            {
+              key: 'toast-' + entry.id,
+              className: 'dc-toast' + (entry.warn ? ' dc-toast-warn' : ''),
+              'data-toast': entry.warn ? 'warn' : 'info',
+            },
+            h('span', { className: 'dc-toast-icon' }, h(Glyph, { name: entry.warn ? 'alert' : 'check', size: 13 })),
+            h('span', { className: 'dc-toast-text' }, entry.text),
+            h(
+              'button',
+              {
+                type: 'button',
+                className: 'dc-toast-close',
+                title: strings.dismiss || 'Dismiss',
+                'aria-label': strings.dismiss || 'Dismiss',
+                onClick: function () {
+                  dismissToast(entry.id)
+                  if (!TOAST_STATE.entries.length && editor && typeof editor.setInlineError === 'function') {
+                    editor.setInlineError('')
+                  }
+                  force(function (value) {
+                    return value + 1
+                  })
+                },
+              },
+              h(Glyph, { name: 'close', size: 11 }),
+            ),
+          )
+        }),
+      )
+    }
+
+    registerAppPanel({
+      id: 'toasts',
+      render: function (ctx) {
+        return h(ToastLayer, { key: 'toast-layer', ctx: ctx })
+      },
+    })
+    /* ------------------------------------------------------------------------------------------
      * Layer tree (v2): multi-select, inline rename, lock, filter, drop indicators
      *
      * The tree is deliberately defensive: it reads the selection from a native
@@ -5696,6 +9250,7 @@ window.__ModuleLoader__.load({
       moveUp: 'Bring forward (Ctrl/Cmd+↑)',
       moveDown: 'Send backward (Ctrl/Cmd+↓)',
       openComment: 'Open this layer in the comment composer',
+      deleteArtboard: 'Delete artboard',
       countOne: '1 layer',
       matchesOne: '1 match',
       selectedOne: '1 selected',
@@ -6003,6 +9558,31 @@ button.dct-badge { cursor: pointer; }
         return true
       }
       return false
+    }
+
+    /**
+     * Delete an artboard from the layers panel. Prefers the editor's undoable `deleteArtboard`;
+     * falls back to the raw op so the button works even on an older hook.
+     */
+    function deleteArtboardById(props, artboard) {
+      if (!artboard || typeof artboard.id !== 'string') return
+      const actions = (props && props.actions) || {}
+      if (typeof actions.deleteArtboard === 'function') {
+        actions.deleteArtboard(artboard.id)
+        return
+      }
+      const editor = editorFromProps(props)
+      if (editor && typeof editor.deleteArtboard === 'function') {
+        editor.deleteArtboard(artboard.id)
+        return
+      }
+      if (typeof actions.runOps === 'function') {
+        actions.runOps([{ type: 'artboard.delete', artboardId: artboard.id }])
+        return
+      }
+      if (editor && typeof editor.runOps === 'function') {
+        editor.runOps([{ type: 'artboard.delete', artboardId: artboard.id }])
+      }
     }
 
     function commitArtboardName(props, artboardId, name) {
@@ -6862,6 +10442,24 @@ button.dct-badge { cursor: pointer; }
                 })
               : h('span', { className: 'dct-name', style: { fontWeight: 600 } }, artboard.name || artboard.id),
             h('span', { className: 'dct-ab-meta' }, String(layerCount)),
+            // Delete the artboard straight from the layers panel (also available on Delete /
+            // right-click). Inline sizing keeps this out of the shared stylesheet.
+            h(
+              'button',
+              {
+                type: 'button',
+                className: 'dc-ibtn dct-ab-del',
+                title: TREE_COPY.deleteArtboard,
+                'aria-label': TREE_COPY.deleteArtboard + ': ' + (artboard.name || artboard.id),
+                style: { width: 16, height: 16, flex: '0 0 auto', opacity: 0.72 },
+                onClick: function (event) {
+                  event.preventDefault()
+                  event.stopPropagation()
+                  deleteArtboardById(props, artboard)
+                },
+              },
+              h(TreeGlyph, { name: 'trash', size: 11 }),
+            ),
           ),
           childRows,
         )
@@ -12221,9 +15819,11 @@ button.dct-badge { cursor: pointer; }
     ]
 
     /* Overlay chrome sizes in *screen* pixels; every one of them is divided by the camera zoom
-     * at render time so handles stay 8px and outlines stay 1px from 10 % to 400 %. */
+     * at render time so handles stay 7px and outlines stay 1px from 10 % to 400 %. */
     const SELECTION_BORDER_SCREEN = 1
-    const SELECTION_HANDLE_SCREEN = 8
+    const SELECTION_HANDLE_SCREEN = 7
+    const SELECTION_HANDLE_BORDER_SCREEN = 1.5
+    const SELECTION_HANDLE_RADIUS_SCREEN = 2
     const PIN_SCREEN = 18
     const LOCK_BADGE_SCREEN = 14
     const MEASURE_BADGE_HEIGHT_SCREEN = 18
@@ -12233,6 +15833,45 @@ button.dct-badge { cursor: pointer; }
     function overlayZoom(value) {
       const zoom = finiteNumber(value, 1)
       return zoom > 0 ? zoom : 1
+    }
+
+    /**
+     * Snap a canvas-unit rect out to whole *screen* pixels.
+     *
+     * The stage carries CSS `zoom`, so a canvas coordinate `x` lands on screen pixel `x * zoom`.
+     * Rounding the screen edges (not the authored canvas edges) is what keeps a 1 px selection
+     * stroke exactly one pixel wide, with no half-pixel blur, at 40 % as well as at 400 %.
+     *
+     * The snap is outward (floor the near edges, ceil the far ones) so a union box always
+     * *covers* every member it wraps, instead of being able to land half a pixel inside one.
+     */
+    function snapOverlayRect(value, zoom) {
+      const z = overlayZoom(zoom)
+      const rect = normalizeOverlayRect(value)
+      const left = Math.floor(rect.x * z) / z
+      const top = Math.floor(rect.y * z) / z
+      const right = Math.ceil((rect.x + rect.width) * z) / z
+      const bottom = Math.ceil((rect.y + rect.height) * z) / z
+      const minimum = 1 / z
+      return {
+        x: left,
+        y: top,
+        width: Math.max(minimum, right - left),
+        height: Math.max(minimum, bottom - top),
+      }
+    }
+
+    /** True when two canvas-unit rects describe the same box, within half a device pixel. */
+    function sameOverlayRect(first, second, zoom) {
+      const a = normalizeOverlayRect(first)
+      const b = normalizeOverlayRect(second)
+      const tolerance = 0.5 / overlayZoom(zoom)
+      return (
+        Math.abs(a.x - b.x) <= tolerance &&
+        Math.abs(a.y - b.y) <= tolerance &&
+        Math.abs(a.width - b.width) <= tolerance &&
+        Math.abs(a.height - b.height) <= tolerance
+      )
     }
 
     function textLineHeight(layer) {
@@ -12529,67 +16168,138 @@ button.dct-badge { cursor: pointer; }
     }
 
     /**
-     * Selection outline for one world rect (canvas units relative to the artboard).
-     * `showHandles` draws the 8 resize handles — the primary selection gets them, secondary
-     * members of a multi-selection get the outline only. Everything is divided by the camera
-     * zoom so the chrome keeps a constant on-screen size.
+     * The single bounding box around a selection, for ONE artboard (Figma-style).
+     *
+     *   SelectionBox({ rect, zoom, handles?, primary?, handlers?, count?, artboardCount?,
+     *                  primaryLayerId?, artboardId? })
+     *     rect           union rect in artboard-local canvas units (computed node worldRect space)
+     *     zoom           camera zoom (px per canvas unit) — every chrome dimension is divided by
+     *                    it, so the box is exactly SELECTION_BORDER_SCREEN px on screen from 10 %
+     *                    to 400 % and the handles stay SELECTION_HANDLE_SCREEN px
+     *     handles        draw the 8 resize handles (single-artboard selections get them)
+     *     primary        this box carries the selection's primary layer (diagnostic attribute)
+     *     handlers       shell handlers: `handlePointerDown(event, handleId)` fires on each
+     *                    handle; `gestureMove/gestureUp/gestureCancel` continue that gesture
+     *     count          total layers in the whole selection  → `data-selection-count`
+     *     artboardCount  how many artboards the selection spans → `data-selection-artboards`
+     *
+     * The union rect is published as `data-selection-bounds` (JSON: {x,y,width,height} in
+     * artboard canvas units) so tests and the interaction layer can read the box geometry
+     * without measuring the DOM. Handles keep their `data-handle` ids; a multi-selection resize
+     * therefore only has to read this box instead of the primary member.
      */
-    function SelectionOverlay(props) {
-      const rect = isObject(props.rect) ? props.rect : {}
+    function SelectionBox(props) {
       const zoom = overlayZoom(props.zoom)
       const inverse = 1 / zoom
+      const rect = snapOverlayRect(props.rect, zoom)
       const handlers = props.handlers
-      const showHandles = props.showHandles !== false
-      const outlineStyle = {
-        left: finiteNumber(rect.x, 0),
-        top: finiteNumber(rect.y, 0),
-        width: Math.max(1, finiteNumber(rect.width, 1)),
-        height: Math.max(1, finiteNumber(rect.height, 1)),
-        borderWidth: SELECTION_BORDER_SCREEN * inverse,
+      const handles = props.handles === true
+      const bounds =
+        '{"x":' +
+        roundTo(rect.x, 3) +
+        ',"y":' +
+        roundTo(rect.y, 3) +
+        ',"width":' +
+        roundTo(rect.width, 3) +
+        ',"height":' +
+        roundTo(rect.height, 3) +
+        '}'
+      const attributes = {
+        className:
+          'dc-sel-box' +
+          (handles ? ' dc-sel-box-handles' : '') +
+          (props.primary ? ' dc-sel-box-primary' : ''),
+        'data-selection-bounds': bounds,
+        'data-selection-count': Math.max(0, Math.round(finiteNumber(props.count, 1))),
+        'data-selection-artboards': Math.max(1, Math.round(finiteNumber(props.artboardCount, 1))),
+        'data-selection-handles': handles ? 'true' : 'false',
+        'data-primary': props.primary ? 'true' : 'false',
+        'data-primary-layer-id':
+          typeof props.primaryLayerId === 'string' ? props.primaryLayerId : '',
+        'data-artboard-id': typeof props.artboardId === 'string' ? props.artboardId : '',
+        style: {
+          left: rect.x,
+          top: rect.y,
+          width: rect.width,
+          height: rect.height,
+          borderWidth: SELECTION_BORDER_SCREEN * inverse,
+        },
       }
-      if (!showHandles) outlineStyle.borderStyle = 'dashed'
+      if (!handles) return h('div', attributes)
       return h(
         'div',
-        {
-          className: 'dc-sel-box' + (showHandles ? '' : ' dc-sel-box-secondary'),
-          'data-primary': showHandles ? 'true' : 'false',
-          style: outlineStyle,
-        },
-        showHandles
-          ? HANDLES.map(function (handle) {
-              return h('div', {
-                key: handle.id,
-                className: 'dc-sel-handle',
-                'data-handle': handle.id,
-                style: {
-                  left: handle.fx * 100 + '%',
-                  top: handle.fy * 100 + '%',
-                  width: SELECTION_HANDLE_SCREEN * inverse,
-                  height: SELECTION_HANDLE_SCREEN * inverse,
-                  borderWidth: SELECTION_BORDER_SCREEN * inverse,
-                  cursor: handle.cursor,
-                  transform: 'translate(-50%, -50%)',
-                },
-                onPointerDown: function (event) {
-                  if (handlers && typeof handlers.handlePointerDown === 'function') {
-                    handlers.handlePointerDown(event, handle.id)
-                  }
-                },
-                onPointerMove: function (event) {
-                  if (handlers && typeof handlers.gestureMove === 'function') handlers.gestureMove(event)
-                },
-                onPointerUp: function (event) {
-                  if (handlers && typeof handlers.gestureUp === 'function') handlers.gestureUp(event)
-                },
-                onPointerCancel: function (event) {
-                  if (handlers && typeof handlers.gestureCancel === 'function') {
-                    handlers.gestureCancel(event)
-                  }
-                },
-              })
-            })
-          : null,
+        attributes,
+        HANDLES.map(function (handle) {
+          return h('div', {
+            key: handle.id,
+            className: 'dc-sel-handle',
+            'data-handle': handle.id,
+            style: {
+              left: handle.fx * 100 + '%',
+              top: handle.fy * 100 + '%',
+              width: SELECTION_HANDLE_SCREEN * inverse,
+              height: SELECTION_HANDLE_SCREEN * inverse,
+              borderWidth: SELECTION_HANDLE_BORDER_SCREEN * inverse,
+              borderRadius: SELECTION_HANDLE_RADIUS_SCREEN * inverse,
+              // Chromium floors fractional *border* widths to whole device pixels, so a 1.5 px
+              // border alone would paint 1 px. The accent ring below is a shadow (never snapped),
+              // so it restores the intended 1.5 px edge while the drop shadow keeps the white
+              // square readable on a light artboard. Both are in canvas units: a CSS px shadow
+              // would scale with the stage zoom, which is exactly what the overlay must not do.
+              boxShadow:
+                '0 0 0 ' +
+                roundTo(0.5 * inverse, 3) +
+                'px rgba(13, 153, 255, 0.9), 0 0 0 ' +
+                roundTo(1 * inverse, 3) +
+                'px rgba(13, 153, 255, 0.16), 0 ' +
+                roundTo(1 * inverse, 3) +
+                'px ' +
+                roundTo(2 * inverse, 3) +
+                'px rgba(15, 23, 42, 0.26)',
+              cursor: handle.cursor,
+              transform: 'translate(-50%, -50%)',
+            },
+            onPointerDown: function (event) {
+              if (handlers && typeof handlers.handlePointerDown === 'function') {
+                handlers.handlePointerDown(event, handle.id)
+              }
+            },
+            onPointerMove: function (event) {
+              if (handlers && typeof handlers.gestureMove === 'function') handlers.gestureMove(event)
+            },
+            onPointerUp: function (event) {
+              if (handlers && typeof handlers.gestureUp === 'function') handlers.gestureUp(event)
+            },
+            onPointerCancel: function (event) {
+              if (handlers && typeof handlers.gestureCancel === 'function') {
+                handlers.gestureCancel(event)
+              }
+            },
+          })
+        }),
       )
+    }
+
+    /**
+     * Thin blue outline around ONE selected object of a multi-selection — no handles, no fill,
+     * never intercepts the pointer. Figma draws these so you can tell which objects the union
+     * `SelectionBox` is wrapping; the union box alone would hide the members.
+     */
+    function SelectionMember(props) {
+      const zoom = overlayZoom(props.zoom)
+      const inverse = 1 / zoom
+      const rect = snapOverlayRect(props.rect, zoom)
+      return h('div', {
+        className: 'dc-sel-member',
+        'data-selection-member': typeof props.layerId === 'string' ? props.layerId : '',
+        style: {
+          left: rect.x,
+          top: rect.y,
+          width: rect.width,
+          height: rect.height,
+          borderWidth: SELECTION_BORDER_SCREEN * inverse,
+        },
+      })
     }
 
     /** Normalize a possibly negative drag rect (marquee, draft measure) into x/y/w/h. */
@@ -12700,25 +16410,30 @@ button.dct-badge { cursor: pointer; }
       const width = Math.max(1, finiteNumber(artboard.width, 1))
       const height = Math.max(1, finiteNumber(artboard.height, 1))
 
-      // Multi-selection: the interaction layer passes `selectedNodes` (an array of computed
-      // nodes); v1 callers only passed `selectedNode`. Both work. The primary entry — the node
-      // matching `primaryLayerId`, else the last one — owns the 8 resize handles.
+      // Selection input: the interaction layer passes `selectedNodes` (an array of computed
+      // nodes) and `selectedLayerIds`. v1 callers only passed `selectedNode`, which still works.
       let selectedNodes = []
-      if (Array.isArray(props.selectedNodes)) {
+      if (Array.isArray(props.selectedNodes) && props.selectedNodes.length > 0) {
         for (let index = 0; index < props.selectedNodes.length; index += 1) {
           if (props.selectedNodes[index]) selectedNodes.push(props.selectedNodes[index])
         }
-      } else if (props.selectedNode) {
-        selectedNodes = [props.selectedNode]
       }
+      if (selectedNodes.length === 0 && props.selectedNode) selectedNodes = [props.selectedNode]
+      const selectedLayerIds = Array.isArray(props.selectedLayerIds) ? props.selectedLayerIds : []
       const primaryLayerId =
         typeof props.primaryLayerId === 'string' ? props.primaryLayerId : selectedLayerId
+      const selectionCount = Math.max(selectedNodes.length, selectedLayerIds.length)
+      // Members on THIS artboard, and how many artboards the whole selection spans. Figma draws
+      // one union box per frame, so a cross-artboard selection never gets a box that wraps
+      // unrelated canvas positions.
       const selectionHere = []
+      const selectionArtboardIds = []
       for (let index = 0; index < selectedNodes.length; index += 1) {
         const candidate = selectedNodes[index]
-        if (candidate && candidate.artboard && candidate.artboard.id === artboard.id) {
-          selectionHere.push(candidate)
-        }
+        if (!candidate || !candidate.artboard || !candidate.artboard.id) continue
+        const ownerId = candidate.artboard.id
+        if (selectionArtboardIds.indexOf(ownerId) < 0) selectionArtboardIds.push(ownerId)
+        if (ownerId === artboard.id) selectionHere.push(candidate)
       }
       let primaryNode = null
       if (selectionHere.length > 0) {
@@ -12731,6 +16446,59 @@ button.dct-badge { cursor: pointer; }
             }
           }
         }
+      }
+      // The union rect of this artboard's members, and whether this box owns the resize handles:
+      // only when the WHOLE selection lives on this artboard (single or multi selection).
+      const selectionUnion = unionRects(
+        selectionHere.map(function (node) {
+          return node.worldRect
+        }),
+      )
+      const selectionHandles =
+        selectionHere.length > 0 && Math.max(1, selectionArtboardIds.length) === 1
+      // The selection's primary layer lives on this artboard (it drives `data-primary` and the
+      // lock badge); with a cross-artboard selection exactly one box is marked primary.
+      let primaryOnThisArtboard = false
+      if (primaryLayerId) {
+        for (let index = 0; index < selectionHere.length; index += 1) {
+          if (selectionHere[index].id === primaryLayerId) {
+            primaryOnThisArtboard = true
+            break
+          }
+        }
+      }
+      const selectionChrome = []
+      if (selectionUnion) {
+        // A member whose box equals the union is already outlined by the union box itself, so it
+        // is skipped — otherwise a single selection would paint a 2 px edge.
+        if (selectionHere.length > 1) {
+          for (let index = 0; index < selectionHere.length; index += 1) {
+            const member = selectionHere[index]
+            if (sameOverlayRect(member.worldRect, selectionUnion, zoom)) continue
+            selectionChrome.push(
+              h(SelectionMember, {
+                key: 'sel-member-' + String(member.id),
+                rect: member.worldRect,
+                zoom: zoom,
+                layerId: member.id,
+              }),
+            )
+          }
+        }
+        selectionChrome.push(
+          h(SelectionBox, {
+            key: 'sel-box',
+            rect: selectionUnion,
+            zoom: zoom,
+            handles: selectionHandles,
+            primary: primaryOnThisArtboard,
+            handlers: handlers,
+            count: selectionCount,
+            artboardCount: Math.max(1, selectionArtboardIds.length),
+            primaryLayerId: primaryOnThisArtboard ? primaryLayerId : '',
+            artboardId: artboard.id,
+          }),
+        )
       }
 
       const artboardSelected = selectionHere.length === 0 && selectedArtboardId === artboard.id
@@ -12791,16 +16559,9 @@ button.dct-badge { cursor: pointer; }
               })
             }),
           ),
-          // One outline per selected layer on this artboard; only the primary gets handles.
-          selectionHere.map(function (node) {
-            return h(SelectionOverlay, {
-              key: 'selection-' + String(node.id),
-              rect: node.worldRect,
-              zoom: zoom,
-              handlers: handlers,
-              showHandles: node === primaryNode,
-            })
-          }),
+          // Figma-style selection chrome: one thin member outline per selected object plus ONE
+          // union box (with the 8 handles) around all of this artboard's members.
+          selectionChrome,
           primaryNode && primaryNode.locked
             ? h(
                 'div',
@@ -14021,35 +17782,111 @@ button.dct-badge { cursor: pointer; }
         return true
       }
 
-      /** Double-click: drill into the nearest containing group (or into a container) and pick it. */
-      function drillIntoNode(node) {
+      /**
+       * Descend from `node` to the deepest visible descendant whose box contains the pointer
+       * (artboard-local coordinates). This is what makes double-click "click through" a stack of
+       * frames/groups in one gesture, the way Figma's deep select behaves.
+       */
+      function deepestNodeAtClientPoint(node, clientX, clientY) {
+        if (!node) return node
+        const current = docRef.current
+        const boardId = artboardIdForNode(node)
+        if (!current || !boardId) return node
+        const entry = computeLayout(current).entryById.get(boardId) || null
+        if (!entry) return node
+        const point = screenToCanvas(clientX, clientY)
+        const local = { x: point.x - entry.frameX, y: point.y - entry.frameY }
+        let deepest = node
+        let guard = 0
+        while (guard < 12) {
+          guard += 1
+          const children = Array.isArray(deepest.children) ? deepest.children : []
+          let next = null
+          // Front-to-back: the last painted child owns the pixel when boxes overlap.
+          for (let index = children.length - 1; index >= 0; index -= 1) {
+            const child = children[index]
+            if (!child || !child.layer || child.layer.visible === false) continue
+            if (rectContainsPoint(child.worldRect, local)) {
+              next = child
+              break
+            }
+          }
+          if (!next) break
+          deepest = next
+        }
+        return deepest
+      }
+
+      /** Closest containing frame/group of a node (used as the drill scope after a deep select). */
+      function containerIdForNode(node) {
+        let current = node ? node.parent : null
+        while (current) {
+          if (isContainerLayer(current.layer)) return current.id
+          current = current.parent
+        }
+        return null
+      }
+
+      /**
+       * Double-click (Figma deep-select): descend to the layer under the pointer and select it, so
+       * repeated double-clicks walk a deeply nested object down to the layer itself. Falls back to
+       * stepping one container level (for a double-click on a container's own background).
+       */
+      function drillIntoNode(node, event) {
         if (!node) return false
-        let group = null
+        const board = artboardIdForNode(node)
+        // A leaf under the pointer IS the deepest object: one double-click selects it (and sets
+        // the scope to its parent container so the following single clicks stay inside it).
+        if (!isContainerLayer(node.layer)) {
+          applySelection([node.id], board, containerIdForNode(node))
+          beacon('deep-select', { layerId: node.id, container: containerIdForNode(node) })
+          return true
+        }
+        // A container: descend to the deepest descendant under the pointer.
+        const clientX = event && Number.isFinite(event.clientX) ? event.clientX : null
+        const clientY = event && Number.isFinite(event.clientY) ? event.clientY : null
+        const deepest =
+          clientX !== null && clientY !== null
+            ? deepestNodeAtClientPoint(node, clientX, clientY)
+            : node
+        if (deepest && deepest.id !== node.id) {
+          applySelection([deepest.id], artboardIdForNode(deepest) || board, containerIdForNode(deepest))
+          beacon('deep-select', { layerId: deepest.id, from: node.id })
+          return true
+        }
+        const drill = drillGroupIdRef.current
+        // Containers from the outermost ancestor down to the node itself.
+        const containers = []
         let current = node.parent || null
         while (current) {
-          if (current.type === 'group') {
-            group = current
-            break
-          }
+          if (isContainerLayer(current.layer)) containers.unshift(current)
           current = current.parent || null
         }
-        if (group) {
-          applySelection([node.id], artboardIdForNode(node), group.id)
-          beacon('drill-in', { layerId: group.id, type: 'group' })
+        if (isContainerLayer(node.layer)) containers.push(node)
+        let nextIndex = 0
+        if (drill) {
+          const at = containers.findIndex(function (container) {
+            return container.id === drill
+          })
+          nextIndex = at >= 0 ? at + 1 : 0
+        }
+        const next = containers[nextIndex] || null
+        if (next) {
+          // The child of `next` that leads toward the double-clicked node (or the node itself).
+          let child = node
+          while (child && child.parent && child.parent.id !== next.id) child = child.parent
+          const childId = child && child.parent && child.parent.id === next.id ? child.id : node.id
+          applySelection([childId], board, next.id)
+          beacon('drill-step', {
+            container: next.id,
+            type: next.type,
+            into: childId,
+            depth: nextIndex,
+          })
           return true
         }
-        if (isContainerLayer(node.layer)) {
-          const kids = Array.isArray(node.children) ? node.children : []
-          const child = kids.length ? kids[kids.length - 1] : null
-          applySelection(
-            child ? [child.id] : [node.id],
-            artboardIdForNode(node),
-            node.type === 'group' ? node.id : drillGroupIdRef.current,
-          )
-          beacon('drill-in', { layerId: node.id, type: node.type })
-          return true
-        }
-        applySelection([node.id], artboardIdForNode(node), drillGroupIdRef.current)
+        applySelection([node.id], board, drill)
+        beacon('drill-step', { container: null, into: node.id, depth: containers.length })
         return true
       }
 
@@ -15632,6 +19469,57 @@ button.dct-badge { cursor: pointer; }
         )
       }
 
+      /**
+       * Delete an artboard (and its subtree, plus the comments anchored to it). Undo re-creates
+       * the board and re-inserts every layer with its original id and props.
+       */
+      function deleteArtboard(artboardId) {
+        const current = docRef.current
+        if (!current) return false
+        const targetId = typeof artboardId === 'string' && artboardId ? artboardId : selectedArtboardIdRef.current
+        if (!targetId) return false
+        const board = findArtboardById(current, targetId)
+        if (!board) return false
+        const boards = artboardsOf(current)
+        const index = boards.findIndex(function (item) {
+          return item && item.id === targetId
+        })
+        // Undo: re-add the artboard, then re-insert its layers (subtrees included) in order.
+        const inverse = [
+          {
+            type: 'artboard.add',
+            artboard: {
+              name: board.name,
+              width: board.width,
+              height: board.height,
+              background: board.background,
+              x: board.x,
+              y: board.y,
+            },
+            index: index >= 0 ? index : undefined,
+          },
+        ]
+        const topLayers = layersOf(board)
+        for (let layerIndex = 0; layerIndex < topLayers.length; layerIndex += 1) {
+          const layer = topLayers[layerIndex]
+          if (!isObject(layer)) continue
+          inverse.push.apply(inverse, insertOpsForSubtree(layer, { artboardId: targetId }, layerIndex))
+        }
+        if (
+          selectedArtboardIdRef.current === targetId ||
+          (selectedLayerIdRef.current && artboardIdForLayer(selectedLayerIdRef.current) === targetId)
+        ) {
+          applySelection([], null, null)
+        }
+        commitWithHistory(
+          'delete-artboard',
+          [{ type: 'artboard.delete', artboardId: targetId }],
+          inverse,
+        )
+        beacon('delete-artboard', { artboardId: targetId, layers: topLayers.length })
+        return true
+      }
+
       function setCommentStatus(commentId, commentStatus) {
         const current = docRef.current
         if (!current) return
@@ -16027,7 +19915,7 @@ button.dct-badge { cursor: pointer; }
           lastLayerPointerRef.current = null
           event.preventDefault()
           event.stopPropagation()
-          drillIntoNode(node)
+          drillIntoNode(node, event)
           return
         }
         const additive = !!(event.shiftKey || event.ctrlKey || event.metaKey)
@@ -16247,12 +20135,51 @@ button.dct-badge { cursor: pointer; }
         setGestureActive(false)
       }
 
+      /**
+       * Ids a marquee rect selects across EVERY artboard. `rect` is expressed in the reference
+       * artboard's local coordinates (so a drag that starts on the empty canvas still has a
+       * stable origin); each board's own local rect is derived from the layout offsets.
+       */
+      function marqueeSelectionIdsAcross(referenceArtboardId, rect) {
+        const tree = treeRef.current
+        const current = docRef.current
+        if (!tree || !current || !isObject(rect)) return []
+        const layoutInfo = computeLayout(current)
+        const reference = layoutInfo.entryById.get(referenceArtboardId) || null
+        if (!reference) return []
+        const boards = Array.isArray(tree.artboards) ? tree.artboards : []
+        const ids = []
+        const seen = new Set()
+        for (let index = 0; index < boards.length; index += 1) {
+          const entry = boards[index]
+          if (!entry || !entry.artboard) continue
+          const boardEntry = layoutInfo.entryById.get(entry.artboard.id) || null
+          if (!boardEntry) continue
+          const localRect = {
+            x: rect.x - (boardEntry.frameX - reference.frameX),
+            y: rect.y - (boardEntry.frameY - reference.frameY),
+            width: rect.width,
+            height: rect.height,
+          }
+          const boardIds = marqueeSelectionIds(entry.artboard.id, localRect)
+          for (let boardIndex = 0; boardIndex < boardIds.length; boardIndex += 1) {
+            const layerId = boardIds[boardIndex]
+            if (seen.has(layerId)) continue
+            seen.add(layerId)
+            ids.push(layerId)
+          }
+        }
+        return ids
+      }
+
       function marqueeUp(active, event) {
         if (!active || !event || event.pointerId !== active.pointerId) return
         endMarquee(active, false)
         if (!active.moved) {
-          // A plain click on the artboard background keeps its v1 meaning.
-          selectArtboard(active.artboardId)
+          // A plain click on the background: inside an artboard it selects the artboard, on the
+          // empty canvas it clears the selection (same as v1).
+          if (active.crossArtboards) clearSelection()
+          else selectArtboard(active.artboardId)
           return
         }
         const point = screenToCanvas(event.clientX, event.clientY)
@@ -16260,15 +20187,25 @@ button.dct-badge { cursor: pointer; }
           x: point.x - active.originX,
           y: point.y - active.originY,
         })
-        const ids = marqueeSelectionIds(active.artboardId, rect)
+        const ids = active.crossArtboards
+          ? marqueeSelectionIdsAcross(active.artboardId, rect)
+          : marqueeSelectionIds(active.artboardId, rect)
         const existing = selectedLayerIdsRef.current
         const nextIds = active.additive
           ? existing.concat(
               ids.filter(function (layerId) { return existing.indexOf(layerId) < 0 }),
             )
           : ids
-        applySelection(nextIds, active.artboardId, drillGroupIdRef.current)
-        beacon('marquee-select', { count: ids.length, additive: active.additive })
+        // The selected artboard follows the first hit so `Move`/align actions have a parent.
+        const boardId = active.crossArtboards
+          ? artboardIdForLayer(nextIds[0]) || active.artboardId
+          : active.artboardId
+        applySelection(nextIds, boardId, drillGroupIdRef.current)
+        beacon('marquee-select', {
+          count: ids.length,
+          additive: active.additive,
+          crossArtboards: !!active.crossArtboards,
+        })
       }
 
       function marqueeCancel(active, event) {
@@ -16276,17 +20213,29 @@ button.dct-badge { cursor: pointer; }
         endMarquee(active, true)
       }
 
-      function beginMarquee(event, artboardId) {
-        if (!event || event.button !== 0 || marqueeRef.current) return
+      function beginMarquee(event, artboardId, options) {
+        if (!event || event.button !== 0 || marqueeRef.current) return false
         const current = docRef.current
-        if (!current) return
+        if (!current) return false
+        const opts = isObject(options) ? options : {}
         const layoutInfo = computeLayout(current)
-        const entry = layoutInfo.entryById.get(artboardId) || null
-        if (!entry) return
+        const boards = artboardsOf(current)
+        // Reference frame: the artboard the drag started in, or the first board when the drag
+        // starts on the empty canvas (the rect may then extend over any number of boards).
+        let referenceId = artboardId || ''
+        if (!referenceId || !layoutInfo.entryById.get(referenceId)) {
+          const first = boards.find(function (board) {
+            return isObject(board) && layoutInfo.entryById.get(board.id)
+          })
+          referenceId = first ? first.id : ''
+        }
+        const entry = referenceId ? layoutInfo.entryById.get(referenceId) || null : null
+        if (!entry) return false
         const point = screenToCanvas(event.clientX, event.clientY)
         const active = {
           pointerId: event.pointerId,
-          artboardId: artboardId,
+          artboardId: referenceId,
+          crossArtboards: opts.crossArtboards === true || !artboardId,
           additive: !!event.shiftKey,
           startX: finiteNumber(event.clientX, 0),
           startY: finiteNumber(event.clientY, 0),
@@ -16313,6 +20262,7 @@ button.dct-badge { cursor: pointer; }
         } catch (error) {
           /* ignore */
         }
+        return true
       }
 
       function cancelMarquee() {
@@ -16582,9 +20532,13 @@ button.dct-badge { cursor: pointer; }
           } catch (error) {
             blank = false
           }
-          // Left drag pans only on the empty canvas background; hits on the artboard
-          // still select, and hits on a layer still start a layer gesture.
+          // Figma: a left drag on the empty canvas draws a selection marquee (it may start
+          // outside every artboard and still catch layers inside them). Panning stays on
+          // space+drag and middle-drag. Hits on an artboard or a layer are handled by their own
+          // pointer handlers, so nothing else starts here.
           if (!blank) return
+          if (beginMarquee(event, null, { crossArtboards: true })) return
+          return
         }
         if (panRef.current) return
         try {
@@ -16876,6 +20830,12 @@ button.dct-badge { cursor: pointer; }
               if (selectedLayerIdsRef.current.length) {
                 event.preventDefault()
                 deleteSelectedLayer()
+                return
+              }
+              // Nothing selected but an artboard is: Delete removes the artboard (item 3).
+              if (selectedArtboardIdRef.current) {
+                event.preventDefault()
+                deleteArtboard(selectedArtboardIdRef.current)
               }
               return
             }
@@ -17466,6 +21426,7 @@ button.dct-badge { cursor: pointer; }
         renameArtboard: renameArtboard,
         reorderLayer: reorderLayer,
         addLayer: addLayer,
+        deleteArtboard: deleteArtboard,
         addButtonPreset: addButtonPreset,
         deleteSelected: deleteSelectedLayer,
         duplicateSelected: duplicateSelected,
@@ -17631,6 +21592,7 @@ button.dct-badge { cursor: pointer; }
         setFrameAutoLayout: setFrameAutoLayout,
         patchFrameLayout: patchFrameLayout,
         addArtboard: addArtboard,
+        deleteArtboard: deleteArtboard,
         setCommentStatus: setCommentStatus,
         deleteCommentById: deleteCommentById,
         sendCommentChat: sendCommentChat,
@@ -18191,6 +22153,7 @@ button.dct-badge { cursor: pointer; }
         setFrameAutoLayout,
         patchFrameLayout,
         addArtboard,
+        deleteArtboard,
         setCommentStatus,
         deleteCommentById,
         canvasPointerDown,
@@ -19145,6 +23108,7 @@ button.dct-badge { cursor: pointer; }
           commitArtboard: commitArtboard,
           openComposer: openComposerFor,
           runOps: runOps,
+          deleteArtboard: deleteArtboard,
           toggleTree: closeTreePanel,
         },
       })
@@ -19307,27 +23271,6 @@ button.dct-badge { cursor: pointer; }
             }),
           ),
         ),
-        inlineError
-          ? h(
-              'div',
-              { className: 'dc-banner' },
-              h(Glyph, { name: 'alert', size: 13 }),
-              h('span', { className: 'dc-banner-text', title: inlineError }, inlineError),
-              h(
-                'button',
-                {
-                  type: 'button',
-                  className: 'dc-banner-close',
-                  title: strings.dismiss,
-                  'aria-label': strings.dismiss,
-                  onClick: function () {
-                    setInlineError('')
-                  },
-                },
-                h(Glyph, { name: 'close', size: 12 }),
-              ),
-            )
-          : null,
         h(
           'div',
           { className: 'dc-toolbar', role: 'toolbar', 'aria-label': strings.pluginTitle },

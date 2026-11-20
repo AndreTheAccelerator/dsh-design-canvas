@@ -457,6 +457,7 @@
         setFrameAutoLayout,
         patchFrameLayout,
         addArtboard,
+        deleteArtboard,
         setCommentStatus,
         deleteCommentById,
         canvasPointerDown,
@@ -1411,6 +1412,7 @@
           commitArtboard: commitArtboard,
           openComposer: openComposerFor,
           runOps: runOps,
+          deleteArtboard: deleteArtboard,
           toggleTree: closeTreePanel,
         },
       })
@@ -1573,27 +1575,6 @@
             }),
           ),
         ),
-        inlineError
-          ? h(
-              'div',
-              { className: 'dc-banner' },
-              h(Glyph, { name: 'alert', size: 13 }),
-              h('span', { className: 'dc-banner-text', title: inlineError }, inlineError),
-              h(
-                'button',
-                {
-                  type: 'button',
-                  className: 'dc-banner-close',
-                  title: strings.dismiss,
-                  'aria-label': strings.dismiss,
-                  onClick: function () {
-                    setInlineError('')
-                  },
-                },
-                h(Glyph, { name: 'close', size: 12 }),
-              ),
-            )
-          : null,
         h(
           'div',
           { className: 'dc-toolbar', role: 'toolbar', 'aria-label': strings.pluginTitle },

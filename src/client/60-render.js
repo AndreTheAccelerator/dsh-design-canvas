@@ -57,9 +57,11 @@
     ]
 
     /* Overlay chrome sizes in *screen* pixels; every one of them is divided by the camera zoom
-     * at render time so handles stay 8px and outlines stay 1px from 10 % to 400 %. */
+     * at render time so handles stay 7px and outlines stay 1px from 10 % to 400 %. */
     const SELECTION_BORDER_SCREEN = 1
-    const SELECTION_HANDLE_SCREEN = 8
+    const SELECTION_HANDLE_SCREEN = 7
+    const SELECTION_HANDLE_BORDER_SCREEN = 1.5
+    const SELECTION_HANDLE_RADIUS_SCREEN = 2
     const PIN_SCREEN = 18
     const LOCK_BADGE_SCREEN = 14
     const MEASURE_BADGE_HEIGHT_SCREEN = 18
@@ -69,6 +71,45 @@
     function overlayZoom(value) {
       const zoom = finiteNumber(value, 1)
       return zoom > 0 ? zoom : 1
+    }
+
+    /**
+     * Snap a canvas-unit rect out to whole *screen* pixels.
+     *
+     * The stage carries CSS `zoom`, so a canvas coordinate `x` lands on screen pixel `x * zoom`.
+     * Rounding the screen edges (not the authored canvas edges) is what keeps a 1 px selection
+     * stroke exactly one pixel wide, with no half-pixel blur, at 40 % as well as at 400 %.
+     *
+     * The snap is outward (floor the near edges, ceil the far ones) so a union box always
+     * *covers* every member it wraps, instead of being able to land half a pixel inside one.
+     */
+    function snapOverlayRect(value, zoom) {
+      const z = overlayZoom(zoom)
+      const rect = normalizeOverlayRect(value)
+      const left = Math.floor(rect.x * z) / z
+      const top = Math.floor(rect.y * z) / z
+      const right = Math.ceil((rect.x + rect.width) * z) / z
+      const bottom = Math.ceil((rect.y + rect.height) * z) / z
+      const minimum = 1 / z
+      return {
+        x: left,
+        y: top,
+        width: Math.max(minimum, right - left),
+        height: Math.max(minimum, bottom - top),
+      }
+    }
+
+    /** True when two canvas-unit rects describe the same box, within half a device pixel. */
+    function sameOverlayRect(first, second, zoom) {
+      const a = normalizeOverlayRect(first)
+      const b = normalizeOverlayRect(second)
+      const tolerance = 0.5 / overlayZoom(zoom)
+      return (
+        Math.abs(a.x - b.x) <= tolerance &&
+        Math.abs(a.y - b.y) <= tolerance &&
+        Math.abs(a.width - b.width) <= tolerance &&
+        Math.abs(a.height - b.height) <= tolerance
+      )
     }
 
     function textLineHeight(layer) {
@@ -365,67 +406,138 @@
     }
 
     /**
-     * Selection outline for one world rect (canvas units relative to the artboard).
-     * `showHandles` draws the 8 resize handles — the primary selection gets them, secondary
-     * members of a multi-selection get the outline only. Everything is divided by the camera
-     * zoom so the chrome keeps a constant on-screen size.
+     * The single bounding box around a selection, for ONE artboard (Figma-style).
+     *
+     *   SelectionBox({ rect, zoom, handles?, primary?, handlers?, count?, artboardCount?,
+     *                  primaryLayerId?, artboardId? })
+     *     rect           union rect in artboard-local canvas units (computed node worldRect space)
+     *     zoom           camera zoom (px per canvas unit) — every chrome dimension is divided by
+     *                    it, so the box is exactly SELECTION_BORDER_SCREEN px on screen from 10 %
+     *                    to 400 % and the handles stay SELECTION_HANDLE_SCREEN px
+     *     handles        draw the 8 resize handles (single-artboard selections get them)
+     *     primary        this box carries the selection's primary layer (diagnostic attribute)
+     *     handlers       shell handlers: `handlePointerDown(event, handleId)` fires on each
+     *                    handle; `gestureMove/gestureUp/gestureCancel` continue that gesture
+     *     count          total layers in the whole selection  → `data-selection-count`
+     *     artboardCount  how many artboards the selection spans → `data-selection-artboards`
+     *
+     * The union rect is published as `data-selection-bounds` (JSON: {x,y,width,height} in
+     * artboard canvas units) so tests and the interaction layer can read the box geometry
+     * without measuring the DOM. Handles keep their `data-handle` ids; a multi-selection resize
+     * therefore only has to read this box instead of the primary member.
      */
-    function SelectionOverlay(props) {
-      const rect = isObject(props.rect) ? props.rect : {}
+    function SelectionBox(props) {
       const zoom = overlayZoom(props.zoom)
       const inverse = 1 / zoom
+      const rect = snapOverlayRect(props.rect, zoom)
       const handlers = props.handlers
-      const showHandles = props.showHandles !== false
-      const outlineStyle = {
-        left: finiteNumber(rect.x, 0),
-        top: finiteNumber(rect.y, 0),
-        width: Math.max(1, finiteNumber(rect.width, 1)),
-        height: Math.max(1, finiteNumber(rect.height, 1)),
-        borderWidth: SELECTION_BORDER_SCREEN * inverse,
+      const handles = props.handles === true
+      const bounds =
+        '{"x":' +
+        roundTo(rect.x, 3) +
+        ',"y":' +
+        roundTo(rect.y, 3) +
+        ',"width":' +
+        roundTo(rect.width, 3) +
+        ',"height":' +
+        roundTo(rect.height, 3) +
+        '}'
+      const attributes = {
+        className:
+          'dc-sel-box' +
+          (handles ? ' dc-sel-box-handles' : '') +
+          (props.primary ? ' dc-sel-box-primary' : ''),
+        'data-selection-bounds': bounds,
+        'data-selection-count': Math.max(0, Math.round(finiteNumber(props.count, 1))),
+        'data-selection-artboards': Math.max(1, Math.round(finiteNumber(props.artboardCount, 1))),
+        'data-selection-handles': handles ? 'true' : 'false',
+        'data-primary': props.primary ? 'true' : 'false',
+        'data-primary-layer-id':
+          typeof props.primaryLayerId === 'string' ? props.primaryLayerId : '',
+        'data-artboard-id': typeof props.artboardId === 'string' ? props.artboardId : '',
+        style: {
+          left: rect.x,
+          top: rect.y,
+          width: rect.width,
+          height: rect.height,
+          borderWidth: SELECTION_BORDER_SCREEN * inverse,
+        },
       }
-      if (!showHandles) outlineStyle.borderStyle = 'dashed'
+      if (!handles) return h('div', attributes)
       return h(
         'div',
-        {
-          className: 'dc-sel-box' + (showHandles ? '' : ' dc-sel-box-secondary'),
-          'data-primary': showHandles ? 'true' : 'false',
-          style: outlineStyle,
-        },
-        showHandles
-          ? HANDLES.map(function (handle) {
-              return h('div', {
-                key: handle.id,
-                className: 'dc-sel-handle',
-                'data-handle': handle.id,
-                style: {
-                  left: handle.fx * 100 + '%',
-                  top: handle.fy * 100 + '%',
-                  width: SELECTION_HANDLE_SCREEN * inverse,
-                  height: SELECTION_HANDLE_SCREEN * inverse,
-                  borderWidth: SELECTION_BORDER_SCREEN * inverse,
-                  cursor: handle.cursor,
-                  transform: 'translate(-50%, -50%)',
-                },
-                onPointerDown: function (event) {
-                  if (handlers && typeof handlers.handlePointerDown === 'function') {
-                    handlers.handlePointerDown(event, handle.id)
-                  }
-                },
-                onPointerMove: function (event) {
-                  if (handlers && typeof handlers.gestureMove === 'function') handlers.gestureMove(event)
-                },
-                onPointerUp: function (event) {
-                  if (handlers && typeof handlers.gestureUp === 'function') handlers.gestureUp(event)
-                },
-                onPointerCancel: function (event) {
-                  if (handlers && typeof handlers.gestureCancel === 'function') {
-                    handlers.gestureCancel(event)
-                  }
-                },
-              })
-            })
-          : null,
+        attributes,
+        HANDLES.map(function (handle) {
+          return h('div', {
+            key: handle.id,
+            className: 'dc-sel-handle',
+            'data-handle': handle.id,
+            style: {
+              left: handle.fx * 100 + '%',
+              top: handle.fy * 100 + '%',
+              width: SELECTION_HANDLE_SCREEN * inverse,
+              height: SELECTION_HANDLE_SCREEN * inverse,
+              borderWidth: SELECTION_HANDLE_BORDER_SCREEN * inverse,
+              borderRadius: SELECTION_HANDLE_RADIUS_SCREEN * inverse,
+              // Chromium floors fractional *border* widths to whole device pixels, so a 1.5 px
+              // border alone would paint 1 px. The accent ring below is a shadow (never snapped),
+              // so it restores the intended 1.5 px edge while the drop shadow keeps the white
+              // square readable on a light artboard. Both are in canvas units: a CSS px shadow
+              // would scale with the stage zoom, which is exactly what the overlay must not do.
+              boxShadow:
+                '0 0 0 ' +
+                roundTo(0.5 * inverse, 3) +
+                'px rgba(13, 153, 255, 0.9), 0 0 0 ' +
+                roundTo(1 * inverse, 3) +
+                'px rgba(13, 153, 255, 0.16), 0 ' +
+                roundTo(1 * inverse, 3) +
+                'px ' +
+                roundTo(2 * inverse, 3) +
+                'px rgba(15, 23, 42, 0.26)',
+              cursor: handle.cursor,
+              transform: 'translate(-50%, -50%)',
+            },
+            onPointerDown: function (event) {
+              if (handlers && typeof handlers.handlePointerDown === 'function') {
+                handlers.handlePointerDown(event, handle.id)
+              }
+            },
+            onPointerMove: function (event) {
+              if (handlers && typeof handlers.gestureMove === 'function') handlers.gestureMove(event)
+            },
+            onPointerUp: function (event) {
+              if (handlers && typeof handlers.gestureUp === 'function') handlers.gestureUp(event)
+            },
+            onPointerCancel: function (event) {
+              if (handlers && typeof handlers.gestureCancel === 'function') {
+                handlers.gestureCancel(event)
+              }
+            },
+          })
+        }),
       )
+    }
+
+    /**
+     * Thin blue outline around ONE selected object of a multi-selection — no handles, no fill,
+     * never intercepts the pointer. Figma draws these so you can tell which objects the union
+     * `SelectionBox` is wrapping; the union box alone would hide the members.
+     */
+    function SelectionMember(props) {
+      const zoom = overlayZoom(props.zoom)
+      const inverse = 1 / zoom
+      const rect = snapOverlayRect(props.rect, zoom)
+      return h('div', {
+        className: 'dc-sel-member',
+        'data-selection-member': typeof props.layerId === 'string' ? props.layerId : '',
+        style: {
+          left: rect.x,
+          top: rect.y,
+          width: rect.width,
+          height: rect.height,
+          borderWidth: SELECTION_BORDER_SCREEN * inverse,
+        },
+      })
     }
 
     /** Normalize a possibly negative drag rect (marquee, draft measure) into x/y/w/h. */
@@ -536,25 +648,30 @@
       const width = Math.max(1, finiteNumber(artboard.width, 1))
       const height = Math.max(1, finiteNumber(artboard.height, 1))
 
-      // Multi-selection: the interaction layer passes `selectedNodes` (an array of computed
-      // nodes); v1 callers only passed `selectedNode`. Both work. The primary entry — the node
-      // matching `primaryLayerId`, else the last one — owns the 8 resize handles.
+      // Selection input: the interaction layer passes `selectedNodes` (an array of computed
+      // nodes) and `selectedLayerIds`. v1 callers only passed `selectedNode`, which still works.
       let selectedNodes = []
-      if (Array.isArray(props.selectedNodes)) {
+      if (Array.isArray(props.selectedNodes) && props.selectedNodes.length > 0) {
         for (let index = 0; index < props.selectedNodes.length; index += 1) {
           if (props.selectedNodes[index]) selectedNodes.push(props.selectedNodes[index])
         }
-      } else if (props.selectedNode) {
-        selectedNodes = [props.selectedNode]
       }
+      if (selectedNodes.length === 0 && props.selectedNode) selectedNodes = [props.selectedNode]
+      const selectedLayerIds = Array.isArray(props.selectedLayerIds) ? props.selectedLayerIds : []
       const primaryLayerId =
         typeof props.primaryLayerId === 'string' ? props.primaryLayerId : selectedLayerId
+      const selectionCount = Math.max(selectedNodes.length, selectedLayerIds.length)
+      // Members on THIS artboard, and how many artboards the whole selection spans. Figma draws
+      // one union box per frame, so a cross-artboard selection never gets a box that wraps
+      // unrelated canvas positions.
       const selectionHere = []
+      const selectionArtboardIds = []
       for (let index = 0; index < selectedNodes.length; index += 1) {
         const candidate = selectedNodes[index]
-        if (candidate && candidate.artboard && candidate.artboard.id === artboard.id) {
-          selectionHere.push(candidate)
-        }
+        if (!candidate || !candidate.artboard || !candidate.artboard.id) continue
+        const ownerId = candidate.artboard.id
+        if (selectionArtboardIds.indexOf(ownerId) < 0) selectionArtboardIds.push(ownerId)
+        if (ownerId === artboard.id) selectionHere.push(candidate)
       }
       let primaryNode = null
       if (selectionHere.length > 0) {
@@ -567,6 +684,59 @@
             }
           }
         }
+      }
+      // The union rect of this artboard's members, and whether this box owns the resize handles:
+      // only when the WHOLE selection lives on this artboard (single or multi selection).
+      const selectionUnion = unionRects(
+        selectionHere.map(function (node) {
+          return node.worldRect
+        }),
+      )
+      const selectionHandles =
+        selectionHere.length > 0 && Math.max(1, selectionArtboardIds.length) === 1
+      // The selection's primary layer lives on this artboard (it drives `data-primary` and the
+      // lock badge); with a cross-artboard selection exactly one box is marked primary.
+      let primaryOnThisArtboard = false
+      if (primaryLayerId) {
+        for (let index = 0; index < selectionHere.length; index += 1) {
+          if (selectionHere[index].id === primaryLayerId) {
+            primaryOnThisArtboard = true
+            break
+          }
+        }
+      }
+      const selectionChrome = []
+      if (selectionUnion) {
+        // A member whose box equals the union is already outlined by the union box itself, so it
+        // is skipped — otherwise a single selection would paint a 2 px edge.
+        if (selectionHere.length > 1) {
+          for (let index = 0; index < selectionHere.length; index += 1) {
+            const member = selectionHere[index]
+            if (sameOverlayRect(member.worldRect, selectionUnion, zoom)) continue
+            selectionChrome.push(
+              h(SelectionMember, {
+                key: 'sel-member-' + String(member.id),
+                rect: member.worldRect,
+                zoom: zoom,
+                layerId: member.id,
+              }),
+            )
+          }
+        }
+        selectionChrome.push(
+          h(SelectionBox, {
+            key: 'sel-box',
+            rect: selectionUnion,
+            zoom: zoom,
+            handles: selectionHandles,
+            primary: primaryOnThisArtboard,
+            handlers: handlers,
+            count: selectionCount,
+            artboardCount: Math.max(1, selectionArtboardIds.length),
+            primaryLayerId: primaryOnThisArtboard ? primaryLayerId : '',
+            artboardId: artboard.id,
+          }),
+        )
       }
 
       const artboardSelected = selectionHere.length === 0 && selectedArtboardId === artboard.id
@@ -627,16 +797,9 @@
               })
             }),
           ),
-          // One outline per selected layer on this artboard; only the primary gets handles.
-          selectionHere.map(function (node) {
-            return h(SelectionOverlay, {
-              key: 'selection-' + String(node.id),
-              rect: node.worldRect,
-              zoom: zoom,
-              handlers: handlers,
-              showHandles: node === primaryNode,
-            })
-          }),
+          // Figma-style selection chrome: one thin member outline per selected object plus ONE
+          // union box (with the 8 handles) around all of this artboard's members.
+          selectionChrome,
           primaryNode && primaryNode.locked
             ? h(
                 'div',

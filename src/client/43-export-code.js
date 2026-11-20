@@ -66,6 +66,12 @@
         artboard: artboard,
         scope: scope,
         layerIds: layerIds,
+        selectionName:
+          typeof input.selectionName === 'string' && input.selectionName
+            ? input.selectionName
+            : layerIds.length === 1
+              ? 'selection'
+              : 'selection-' + layerIds.length + '-layers',
         scale: scale,
         includeComments: input.includeComments === true,
         pretty: input.pretty !== false,
@@ -980,6 +986,11 @@
     /** Rasterise the SVG export into a PNG data URL (browser only; rejects in Node). */
     function renderPngDataUrl(doc, options) {
       const resolved = resolveExportOptions(doc, options)
+      // A selection is rendered through its synthetic document (see exportTargetDoc).
+      const target = exportTargetDoc(doc, resolved)
+      if (target && target !== doc) {
+        return renderPngDataUrl(target, { scale: resolved.scale })
+      }
       const artboard = resolved.artboard
       const svg = renderSvg(doc, options)
       if (!artboard) return Promise.reject(new Error('no artboard to export'))
@@ -1129,20 +1140,148 @@
       }
     }
 
+    /* --- selection export ------------------------------------------------------------------
+     * "Export objects, not only artboards": the selection is re-rooted into a synthetic
+     * one-artboard document whose size is the selection's bounding box, with every root moved to
+     * its absolute position. The existing renderers then run unchanged, so HTML/React/SVG/PNG/JSON
+     * all support a selection without a second code path.
+     * -------------------------------------------------------------------------------------- */
+
+    /** Outermost selected computed nodes (a selected container covers its descendants). */
+    function selectionExportRoots(doc, layerIds) {
+      const tree = buildComputedTree(doc)
+      const wanted = new Set(
+        (Array.isArray(layerIds) ? layerIds : []).filter(function (id) {
+          return typeof id === 'string' && id
+        }),
+      )
+      if (!wanted.size) return []
+      const roots = []
+      const visit = function (nodes) {
+        const list = Array.isArray(nodes) ? nodes : []
+        for (let index = 0; index < list.length; index += 1) {
+          const node = list[index]
+          if (!node || !node.layer) continue
+          if (wanted.has(node.id)) {
+            roots.push(node)
+            continue
+          }
+          if (Array.isArray(node.children) && node.children.length) visit(node.children)
+        }
+      }
+      const boards = Array.isArray(tree.artboards) ? tree.artboards : []
+      for (let index = 0; index < boards.length; index += 1) {
+        const entry = boards[index]
+        if (entry && Array.isArray(entry.layers)) visit(entry.layers)
+      }
+      return roots
+    }
+
+    /** Bounding box of computed nodes, in artboard-local canvas units. */
+    function nodesBoundingBox(nodes) {
+      let minX = Infinity
+      let minY = Infinity
+      let maxX = -Infinity
+      let maxY = -Infinity
+      const list = Array.isArray(nodes) ? nodes : []
+      for (let index = 0; index < list.length; index += 1) {
+        const rect = list[index] && list[index].worldRect
+        if (!rect) continue
+        minX = Math.min(minX, finiteNumber(rect.x, 0))
+        minY = Math.min(minY, finiteNumber(rect.y, 0))
+        maxX = Math.max(maxX, finiteNumber(rect.x, 0) + Math.max(0, finiteNumber(rect.width, 0)))
+        maxY = Math.max(maxY, finiteNumber(rect.y, 0) + Math.max(0, finiteNumber(rect.height, 0)))
+      }
+      if (!Number.isFinite(minX) || !Number.isFinite(minY)) return null
+      return {
+        x: minX,
+        y: minY,
+        width: Math.max(1, maxX - minX),
+        height: Math.max(1, maxY - minY),
+      }
+    }
+
+    /**
+     * A synthetic document holding just the selection. Roots become absolutely positioned at their
+     * rendered position (so a layer that lived inside an auto-layout frame lands where it looked),
+     * children keep their relative coordinates.
+     */
+    function selectionExportDoc(doc, layerIds, name) {
+      const roots = selectionExportRoots(doc, layerIds)
+      if (!roots.length) return null
+      const box = nodesBoundingBox(roots)
+      if (!box) return null
+      const layers = roots.map(function (node) {
+        const layer = node.layer
+        const rect = node.worldRect || { x: 0, y: 0, width: layer.width, height: layer.height }
+        const copy = cloneLayerProps(layer)
+        copy.x = roundTo(finiteNumber(rect.x, 0) - box.x, 2)
+        copy.y = roundTo(finiteNumber(rect.y, 0) - box.y, 2)
+        copy.width = Math.max(1, roundTo(finiteNumber(rect.width, finiteNumber(layer.width, 1)), 2))
+        copy.height = Math.max(1, roundTo(finiteNumber(rect.height, finiteNumber(layer.height, 1)), 2))
+        return copy
+      })
+      return {
+        schemaVersion: doc && doc.schemaVersion ? doc.schemaVersion : 1,
+        name: (doc && doc.name) || 'Design',
+        version: doc && typeof doc.version === 'number' ? doc.version : 1,
+        updatedAt: (doc && doc.updatedAt) || '1970-01-01T00:00:00.000Z',
+        artboards: [
+          {
+            id: 'ab-selection',
+            name: name || 'Selection',
+            x: 0,
+            y: 0,
+            width: Math.ceil(box.width),
+            height: Math.ceil(box.height),
+            background: 'transparent',
+            layers: layers,
+          },
+        ],
+        comments: [],
+      }
+    }
+
+    /** Deep copy of a layer's authored props (no computed fields, no shared arrays). */
+    function cloneLayerProps(layer) {
+      const copy = {}
+      const keys = Object.keys(layer || {})
+      for (let index = 0; index < keys.length; index += 1) {
+        const key = keys[index]
+        const value = layer[key]
+        if (Array.isArray(value)) copy[key] = value.slice()
+        else if (isObject(value)) copy[key] = JSON.parse(JSON.stringify(value))
+        else copy[key] = value
+      }
+      return copy
+    }
+
+    /** Resolve the document a format should render: the selection wrapped as a document, or doc. */
+    function exportTargetDoc(doc, resolved) {
+      if (!doc) return null
+      if (resolved && resolved.scope === 'selection' && resolved.layerIds && resolved.layerIds.length) {
+        return selectionExportDoc(doc, resolved.layerIds, resolved.selectionName) || doc
+      }
+      return doc
+    }
+
     /** Export the current document in one of EXPORT_FORMATS; returns a string (PNG: data URL). */
     function renderExport(doc, format, options) {
+      const resolved = resolveExportOptions(doc, options)
+      const target = exportTargetDoc(doc, resolved) || doc
+      const forwarded = resolved.scope === 'selection' ? { pretty: resolved.pretty } : options
       switch (format) {
         case 'json':
-          return renderJson(doc, options)
+          return renderJson(target, forwarded)
         case 'svg':
-          return renderSvg(doc, options)
+          return renderSvg(target, forwarded)
         case 'react':
-          return renderReact(doc, options)
+          return renderReact(target, forwarded)
         case 'png':
-          return renderPngDataUrl(doc, options)
+          return renderPngDataUrl(target, forwarded)
         case 'html':
         default:
-          return renderHtml(doc, options)
+          return renderHtml(target, forwarded)
       }
     }
 

@@ -241,3 +241,56 @@ test('export generators are registered and produce non-empty output', () => {
     assert.doesNotThrow(() => JSON.parse(json))
   }
 })
+
+test('export can target a selection (objects, not only artboards)', () => {
+  const doc = {
+    schemaVersion: 1,
+    name: 'Tiny',
+    version: 1,
+    updatedAt: '2026-01-01T00:00:00.000Z',
+    artboards: [
+      {
+        id: 'ab-1',
+        name: 'Board',
+        x: 0,
+        y: 0,
+        width: 800,
+        height: 600,
+        background: '#ffffff',
+        layers: [
+          { id: 'l-a', type: 'rect', name: 'A', x: 10, y: 20, width: 100, height: 40, fill: '#111827' },
+          { id: 'l-b', type: 'rect', name: 'B', x: 210, y: 20, width: 100, height: 40, fill: '#2563eb' },
+          { id: 'l-c', type: 'text', name: 'C', x: 10, y: 300, width: 300, height: 40, text: 'Outside', fontSize: 16 },
+        ],
+      },
+    ],
+    comments: [],
+  }
+
+  if (typeof t.renderExport !== 'function') return
+
+  // Two layers 300 px apart, 100 px wide: the export is exactly their union box.
+  const options = { scope: 'selection', layerIds: ['l-a', 'l-b'] }
+  const json = JSON.parse(t.renderExport(doc, 'json', options))
+  assert.equal(json.artboards.length, 1, 'the selection becomes its own document')
+  assert.equal(json.artboards[0].width, 300, 'width is the union bounding box')
+  assert.equal(json.artboards[0].height, 40)
+  assert.deepEqual(
+    json.artboards[0].layers.map((layer) => layer.name),
+    ['A', 'B'],
+    'only the selected layers are exported',
+  )
+  assert.equal(json.artboards[0].layers[0].x, 0, 'the first layer is re-based to the box origin')
+  assert.equal(json.artboards[0].layers[1].x, 200, 'sibling offsets are preserved')
+
+  const svg = t.renderExport(doc, 'svg', options)
+  assert.match(svg, /<svg[^>]+width="300"/, 'svg carries the selection box width')
+  assert.ok(svg.includes('viewBox="0 0 300 40"'), 'svg view box is the selection box')
+
+  // A single layer exports its own box, and an empty selection falls back to the artboard.
+  const one = JSON.parse(t.renderExport(doc, 'json', { scope: 'selection', layerIds: ['l-c'] }))
+  assert.equal(one.artboards[0].width, 300)
+  assert.equal(one.artboards[0].layers.length, 1)
+  const fallback = JSON.parse(t.renderExport(doc, 'json', { scope: 'selection', layerIds: [] }))
+  assert.equal(fallback.artboards[0].layers.length, 3, 'no selection falls back to the whole board')
+})

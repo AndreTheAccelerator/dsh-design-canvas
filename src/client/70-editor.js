@@ -1069,35 +1069,111 @@
         return true
       }
 
-      /** Double-click: drill into the nearest containing group (or into a container) and pick it. */
-      function drillIntoNode(node) {
+      /**
+       * Descend from `node` to the deepest visible descendant whose box contains the pointer
+       * (artboard-local coordinates). This is what makes double-click "click through" a stack of
+       * frames/groups in one gesture, the way Figma's deep select behaves.
+       */
+      function deepestNodeAtClientPoint(node, clientX, clientY) {
+        if (!node) return node
+        const current = docRef.current
+        const boardId = artboardIdForNode(node)
+        if (!current || !boardId) return node
+        const entry = computeLayout(current).entryById.get(boardId) || null
+        if (!entry) return node
+        const point = screenToCanvas(clientX, clientY)
+        const local = { x: point.x - entry.frameX, y: point.y - entry.frameY }
+        let deepest = node
+        let guard = 0
+        while (guard < 12) {
+          guard += 1
+          const children = Array.isArray(deepest.children) ? deepest.children : []
+          let next = null
+          // Front-to-back: the last painted child owns the pixel when boxes overlap.
+          for (let index = children.length - 1; index >= 0; index -= 1) {
+            const child = children[index]
+            if (!child || !child.layer || child.layer.visible === false) continue
+            if (rectContainsPoint(child.worldRect, local)) {
+              next = child
+              break
+            }
+          }
+          if (!next) break
+          deepest = next
+        }
+        return deepest
+      }
+
+      /** Closest containing frame/group of a node (used as the drill scope after a deep select). */
+      function containerIdForNode(node) {
+        let current = node ? node.parent : null
+        while (current) {
+          if (isContainerLayer(current.layer)) return current.id
+          current = current.parent
+        }
+        return null
+      }
+
+      /**
+       * Double-click (Figma deep-select): descend to the layer under the pointer and select it, so
+       * repeated double-clicks walk a deeply nested object down to the layer itself. Falls back to
+       * stepping one container level (for a double-click on a container's own background).
+       */
+      function drillIntoNode(node, event) {
         if (!node) return false
-        let group = null
+        const board = artboardIdForNode(node)
+        // A leaf under the pointer IS the deepest object: one double-click selects it (and sets
+        // the scope to its parent container so the following single clicks stay inside it).
+        if (!isContainerLayer(node.layer)) {
+          applySelection([node.id], board, containerIdForNode(node))
+          beacon('deep-select', { layerId: node.id, container: containerIdForNode(node) })
+          return true
+        }
+        // A container: descend to the deepest descendant under the pointer.
+        const clientX = event && Number.isFinite(event.clientX) ? event.clientX : null
+        const clientY = event && Number.isFinite(event.clientY) ? event.clientY : null
+        const deepest =
+          clientX !== null && clientY !== null
+            ? deepestNodeAtClientPoint(node, clientX, clientY)
+            : node
+        if (deepest && deepest.id !== node.id) {
+          applySelection([deepest.id], artboardIdForNode(deepest) || board, containerIdForNode(deepest))
+          beacon('deep-select', { layerId: deepest.id, from: node.id })
+          return true
+        }
+        const drill = drillGroupIdRef.current
+        // Containers from the outermost ancestor down to the node itself.
+        const containers = []
         let current = node.parent || null
         while (current) {
-          if (current.type === 'group') {
-            group = current
-            break
-          }
+          if (isContainerLayer(current.layer)) containers.unshift(current)
           current = current.parent || null
         }
-        if (group) {
-          applySelection([node.id], artboardIdForNode(node), group.id)
-          beacon('drill-in', { layerId: group.id, type: 'group' })
+        if (isContainerLayer(node.layer)) containers.push(node)
+        let nextIndex = 0
+        if (drill) {
+          const at = containers.findIndex(function (container) {
+            return container.id === drill
+          })
+          nextIndex = at >= 0 ? at + 1 : 0
+        }
+        const next = containers[nextIndex] || null
+        if (next) {
+          // The child of `next` that leads toward the double-clicked node (or the node itself).
+          let child = node
+          while (child && child.parent && child.parent.id !== next.id) child = child.parent
+          const childId = child && child.parent && child.parent.id === next.id ? child.id : node.id
+          applySelection([childId], board, next.id)
+          beacon('drill-step', {
+            container: next.id,
+            type: next.type,
+            into: childId,
+            depth: nextIndex,
+          })
           return true
         }
-        if (isContainerLayer(node.layer)) {
-          const kids = Array.isArray(node.children) ? node.children : []
-          const child = kids.length ? kids[kids.length - 1] : null
-          applySelection(
-            child ? [child.id] : [node.id],
-            artboardIdForNode(node),
-            node.type === 'group' ? node.id : drillGroupIdRef.current,
-          )
-          beacon('drill-in', { layerId: node.id, type: node.type })
-          return true
-        }
-        applySelection([node.id], artboardIdForNode(node), drillGroupIdRef.current)
+        applySelection([node.id], board, drill)
+        beacon('drill-step', { container: null, into: node.id, depth: containers.length })
         return true
       }
 
@@ -2680,6 +2756,57 @@
         )
       }
 
+      /**
+       * Delete an artboard (and its subtree, plus the comments anchored to it). Undo re-creates
+       * the board and re-inserts every layer with its original id and props.
+       */
+      function deleteArtboard(artboardId) {
+        const current = docRef.current
+        if (!current) return false
+        const targetId = typeof artboardId === 'string' && artboardId ? artboardId : selectedArtboardIdRef.current
+        if (!targetId) return false
+        const board = findArtboardById(current, targetId)
+        if (!board) return false
+        const boards = artboardsOf(current)
+        const index = boards.findIndex(function (item) {
+          return item && item.id === targetId
+        })
+        // Undo: re-add the artboard, then re-insert its layers (subtrees included) in order.
+        const inverse = [
+          {
+            type: 'artboard.add',
+            artboard: {
+              name: board.name,
+              width: board.width,
+              height: board.height,
+              background: board.background,
+              x: board.x,
+              y: board.y,
+            },
+            index: index >= 0 ? index : undefined,
+          },
+        ]
+        const topLayers = layersOf(board)
+        for (let layerIndex = 0; layerIndex < topLayers.length; layerIndex += 1) {
+          const layer = topLayers[layerIndex]
+          if (!isObject(layer)) continue
+          inverse.push.apply(inverse, insertOpsForSubtree(layer, { artboardId: targetId }, layerIndex))
+        }
+        if (
+          selectedArtboardIdRef.current === targetId ||
+          (selectedLayerIdRef.current && artboardIdForLayer(selectedLayerIdRef.current) === targetId)
+        ) {
+          applySelection([], null, null)
+        }
+        commitWithHistory(
+          'delete-artboard',
+          [{ type: 'artboard.delete', artboardId: targetId }],
+          inverse,
+        )
+        beacon('delete-artboard', { artboardId: targetId, layers: topLayers.length })
+        return true
+      }
+
       function setCommentStatus(commentId, commentStatus) {
         const current = docRef.current
         if (!current) return
@@ -3075,7 +3202,7 @@
           lastLayerPointerRef.current = null
           event.preventDefault()
           event.stopPropagation()
-          drillIntoNode(node)
+          drillIntoNode(node, event)
           return
         }
         const additive = !!(event.shiftKey || event.ctrlKey || event.metaKey)
@@ -3295,12 +3422,51 @@
         setGestureActive(false)
       }
 
+      /**
+       * Ids a marquee rect selects across EVERY artboard. `rect` is expressed in the reference
+       * artboard's local coordinates (so a drag that starts on the empty canvas still has a
+       * stable origin); each board's own local rect is derived from the layout offsets.
+       */
+      function marqueeSelectionIdsAcross(referenceArtboardId, rect) {
+        const tree = treeRef.current
+        const current = docRef.current
+        if (!tree || !current || !isObject(rect)) return []
+        const layoutInfo = computeLayout(current)
+        const reference = layoutInfo.entryById.get(referenceArtboardId) || null
+        if (!reference) return []
+        const boards = Array.isArray(tree.artboards) ? tree.artboards : []
+        const ids = []
+        const seen = new Set()
+        for (let index = 0; index < boards.length; index += 1) {
+          const entry = boards[index]
+          if (!entry || !entry.artboard) continue
+          const boardEntry = layoutInfo.entryById.get(entry.artboard.id) || null
+          if (!boardEntry) continue
+          const localRect = {
+            x: rect.x - (boardEntry.frameX - reference.frameX),
+            y: rect.y - (boardEntry.frameY - reference.frameY),
+            width: rect.width,
+            height: rect.height,
+          }
+          const boardIds = marqueeSelectionIds(entry.artboard.id, localRect)
+          for (let boardIndex = 0; boardIndex < boardIds.length; boardIndex += 1) {
+            const layerId = boardIds[boardIndex]
+            if (seen.has(layerId)) continue
+            seen.add(layerId)
+            ids.push(layerId)
+          }
+        }
+        return ids
+      }
+
       function marqueeUp(active, event) {
         if (!active || !event || event.pointerId !== active.pointerId) return
         endMarquee(active, false)
         if (!active.moved) {
-          // A plain click on the artboard background keeps its v1 meaning.
-          selectArtboard(active.artboardId)
+          // A plain click on the background: inside an artboard it selects the artboard, on the
+          // empty canvas it clears the selection (same as v1).
+          if (active.crossArtboards) clearSelection()
+          else selectArtboard(active.artboardId)
           return
         }
         const point = screenToCanvas(event.clientX, event.clientY)
@@ -3308,15 +3474,25 @@
           x: point.x - active.originX,
           y: point.y - active.originY,
         })
-        const ids = marqueeSelectionIds(active.artboardId, rect)
+        const ids = active.crossArtboards
+          ? marqueeSelectionIdsAcross(active.artboardId, rect)
+          : marqueeSelectionIds(active.artboardId, rect)
         const existing = selectedLayerIdsRef.current
         const nextIds = active.additive
           ? existing.concat(
               ids.filter(function (layerId) { return existing.indexOf(layerId) < 0 }),
             )
           : ids
-        applySelection(nextIds, active.artboardId, drillGroupIdRef.current)
-        beacon('marquee-select', { count: ids.length, additive: active.additive })
+        // The selected artboard follows the first hit so `Move`/align actions have a parent.
+        const boardId = active.crossArtboards
+          ? artboardIdForLayer(nextIds[0]) || active.artboardId
+          : active.artboardId
+        applySelection(nextIds, boardId, drillGroupIdRef.current)
+        beacon('marquee-select', {
+          count: ids.length,
+          additive: active.additive,
+          crossArtboards: !!active.crossArtboards,
+        })
       }
 
       function marqueeCancel(active, event) {
@@ -3324,17 +3500,29 @@
         endMarquee(active, true)
       }
 
-      function beginMarquee(event, artboardId) {
-        if (!event || event.button !== 0 || marqueeRef.current) return
+      function beginMarquee(event, artboardId, options) {
+        if (!event || event.button !== 0 || marqueeRef.current) return false
         const current = docRef.current
-        if (!current) return
+        if (!current) return false
+        const opts = isObject(options) ? options : {}
         const layoutInfo = computeLayout(current)
-        const entry = layoutInfo.entryById.get(artboardId) || null
-        if (!entry) return
+        const boards = artboardsOf(current)
+        // Reference frame: the artboard the drag started in, or the first board when the drag
+        // starts on the empty canvas (the rect may then extend over any number of boards).
+        let referenceId = artboardId || ''
+        if (!referenceId || !layoutInfo.entryById.get(referenceId)) {
+          const first = boards.find(function (board) {
+            return isObject(board) && layoutInfo.entryById.get(board.id)
+          })
+          referenceId = first ? first.id : ''
+        }
+        const entry = referenceId ? layoutInfo.entryById.get(referenceId) || null : null
+        if (!entry) return false
         const point = screenToCanvas(event.clientX, event.clientY)
         const active = {
           pointerId: event.pointerId,
-          artboardId: artboardId,
+          artboardId: referenceId,
+          crossArtboards: opts.crossArtboards === true || !artboardId,
           additive: !!event.shiftKey,
           startX: finiteNumber(event.clientX, 0),
           startY: finiteNumber(event.clientY, 0),
@@ -3361,6 +3549,7 @@
         } catch (error) {
           /* ignore */
         }
+        return true
       }
 
       function cancelMarquee() {
@@ -3630,9 +3819,13 @@
           } catch (error) {
             blank = false
           }
-          // Left drag pans only on the empty canvas background; hits on the artboard
-          // still select, and hits on a layer still start a layer gesture.
+          // Figma: a left drag on the empty canvas draws a selection marquee (it may start
+          // outside every artboard and still catch layers inside them). Panning stays on
+          // space+drag and middle-drag. Hits on an artboard or a layer are handled by their own
+          // pointer handlers, so nothing else starts here.
           if (!blank) return
+          if (beginMarquee(event, null, { crossArtboards: true })) return
+          return
         }
         if (panRef.current) return
         try {
@@ -3924,6 +4117,12 @@
               if (selectedLayerIdsRef.current.length) {
                 event.preventDefault()
                 deleteSelectedLayer()
+                return
+              }
+              // Nothing selected but an artboard is: Delete removes the artboard (item 3).
+              if (selectedArtboardIdRef.current) {
+                event.preventDefault()
+                deleteArtboard(selectedArtboardIdRef.current)
               }
               return
             }
@@ -4514,6 +4713,7 @@
         renameArtboard: renameArtboard,
         reorderLayer: reorderLayer,
         addLayer: addLayer,
+        deleteArtboard: deleteArtboard,
         addButtonPreset: addButtonPreset,
         deleteSelected: deleteSelectedLayer,
         duplicateSelected: duplicateSelected,
@@ -4679,6 +4879,7 @@
         setFrameAutoLayout: setFrameAutoLayout,
         patchFrameLayout: patchFrameLayout,
         addArtboard: addArtboard,
+        deleteArtboard: deleteArtboard,
         setCommentStatus: setCommentStatus,
         deleteCommentById: deleteCommentById,
         sendCommentChat: sendCommentChat,

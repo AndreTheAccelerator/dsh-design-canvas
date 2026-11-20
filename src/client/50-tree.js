@@ -35,6 +35,7 @@
       moveUp: 'Bring forward (Ctrl/Cmd+↑)',
       moveDown: 'Send backward (Ctrl/Cmd+↓)',
       openComment: 'Open this layer in the comment composer',
+      deleteArtboard: 'Delete artboard',
       countOne: '1 layer',
       matchesOne: '1 match',
       selectedOne: '1 selected',
@@ -342,6 +343,31 @@ button.dct-badge { cursor: pointer; }
         return true
       }
       return false
+    }
+
+    /**
+     * Delete an artboard from the layers panel. Prefers the editor's undoable `deleteArtboard`;
+     * falls back to the raw op so the button works even on an older hook.
+     */
+    function deleteArtboardById(props, artboard) {
+      if (!artboard || typeof artboard.id !== 'string') return
+      const actions = (props && props.actions) || {}
+      if (typeof actions.deleteArtboard === 'function') {
+        actions.deleteArtboard(artboard.id)
+        return
+      }
+      const editor = editorFromProps(props)
+      if (editor && typeof editor.deleteArtboard === 'function') {
+        editor.deleteArtboard(artboard.id)
+        return
+      }
+      if (typeof actions.runOps === 'function') {
+        actions.runOps([{ type: 'artboard.delete', artboardId: artboard.id }])
+        return
+      }
+      if (editor && typeof editor.runOps === 'function') {
+        editor.runOps([{ type: 'artboard.delete', artboardId: artboard.id }])
+      }
     }
 
     function commitArtboardName(props, artboardId, name) {
@@ -1201,6 +1227,24 @@ button.dct-badge { cursor: pointer; }
                 })
               : h('span', { className: 'dct-name', style: { fontWeight: 600 } }, artboard.name || artboard.id),
             h('span', { className: 'dct-ab-meta' }, String(layerCount)),
+            // Delete the artboard straight from the layers panel (also available on Delete /
+            // right-click). Inline sizing keeps this out of the shared stylesheet.
+            h(
+              'button',
+              {
+                type: 'button',
+                className: 'dc-ibtn dct-ab-del',
+                title: TREE_COPY.deleteArtboard,
+                'aria-label': TREE_COPY.deleteArtboard + ': ' + (artboard.name || artboard.id),
+                style: { width: 16, height: 16, flex: '0 0 auto', opacity: 0.72 },
+                onClick: function (event) {
+                  event.preventDefault()
+                  event.stopPropagation()
+                  deleteArtboardById(props, artboard)
+                },
+              },
+              h(TreeGlyph, { name: 'trash', size: 11 }),
+            ),
           ),
           childRows,
         )
