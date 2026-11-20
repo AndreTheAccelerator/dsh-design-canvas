@@ -3340,9 +3340,6 @@ window.__ModuleLoader__.load({
 .dc-modal { display: flex; flex-direction: column; gap: 10px; width: 100%; max-width: 340px; max-height: 100%; overflow: auto; padding: 14px; background: var(--dsw-alias-bg-overlay, #ffffff); border: 1px solid var(--dsw-alias-border-l1, #e3e4e8); border-radius: 8px; box-shadow: 0 24px 48px rgba(15, 23, 42, 0.28); }
 .dc-modal-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .dc-modal-title { font-size: 13px; font-weight: 600; color: var(--dsw-alias-label-primary, #1a1c21); }
-.dc-shortcut-list { display: flex; flex-direction: column; gap: 6px; }
-.dc-shortcut-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-size: 12px; color: var(--dsw-alias-label-secondary, #6b7280); }
-.dc-shortcut-keys { display: inline-flex; align-items: center; gap: 4px; flex: 0 0 auto; }
 .dc-kbd { display: inline-flex; align-items: center; min-height: 18px; padding: 0 5px; border: 1px solid var(--dsw-alias-border-l1, #e3e4e8); border-bottom-width: 2px; border-radius: 4px; background: var(--dsw-alias-bg-layer-1, #f7f7f8); font-size: 11px; color: var(--dsw-alias-label-secondary, #6b7280); }
 
 /* ------------------------------------------------------------------ narrow container adaptations */
@@ -5968,14 +5965,17 @@ window.__ModuleLoader__.load({
     }
 
     const CONTEXT_MENU_CSS = `
-.dc-ctxmenu { position: fixed; z-index: 80; box-sizing: border-box; display: flex; flex-direction: column; gap: 1px; min-width: 200px; max-width: 280px; padding: 4px; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; background: var(--dsw-alias-bg-overlay, #ffffff); border: 1px solid var(--dsw-alias-border-l1, #e3e4e8); border-radius: 8px; box-shadow: 0 12px 32px rgba(15, 23, 42, 0.2), 0 2px 6px rgba(15, 23, 42, 0.08); font-size: 12px; }
-.dc-ctxmenu:focus { outline: none; }
+.dc-ctxmenu { position: fixed; z-index: 80; box-sizing: border-box; display: flex; flex-direction: column; gap: 1px; min-width: min(200px, calc(100cqw - 12px)); max-width: min(280px, calc(100cqw - 12px)); padding: 4px; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; background: var(--dsw-alias-bg-overlay, #ffffff); border: 1px solid var(--dsw-alias-border-l1, #e3e4e8); border-radius: 8px; box-shadow: 0 12px 32px rgba(15, 23, 42, 0.2), 0 2px 6px rgba(15, 23, 42, 0.08); font-size: 12px; }
+.dc-ctxmenu:focus:not(:focus-visible) { outline: none; }
 .dc-ctxmenu:focus-visible { outline: 2px solid var(--dsw-alias-brand-primary, #3b82f6); outline-offset: 2px; }
 .dcm-head { flex: 0 0 auto; max-width: 100%; padding: 3px 8px 5px; margin-bottom: 2px; border-bottom: 1px solid var(--dsw-alias-border-l1, #e3e4e8); font-size: 10.5px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: var(--dsw-alias-label-secondary, #6b7280); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .dc-ctxmenu .dc-menu-item { flex: 0 0 auto; }
 .dc-ctxmenu .dc-menu-sep { flex: 0 0 auto; }
 .dc-ctxmenu .dc-menu-item[aria-disabled="true"] { opacity: 0.45; cursor: default; }
-.dc-ctxmenu .dc-menu-item[aria-disabled="true"]:hover { background: transparent; }
+/* A disabled row stays transparent even under a pointer; hover only exists on fine pointers. */
+@media (hover: hover) and (pointer: fine) {
+  .dc-ctxmenu .dc-menu-item[aria-disabled="true"]:hover { background: transparent; }
+}
 .dc-ctxmenu .dc-menu-item.dcm-active:not([aria-disabled="true"]) { background: var(--dsw-alias-bg-layer-2, #f0f0f2); }
 @media (prefers-reduced-motion: no-preference) {
   .dc-ctxmenu { animation: dcm-in 90ms ease-out; }
@@ -5993,6 +5993,21 @@ window.__ModuleLoader__.load({
 
     function contextMenuLiveCtx(fallback) {
       return CONTEXT_MENU_STATE.liveCtx || fallback || null
+    }
+
+    /**
+     * The selection as it is NOW. Menu rows are built before the right-click's selection has been
+     * committed to React state, so actions must read the editor's synchronous ref, never the
+     * snapshot the row was built from.
+     */
+    function contextMenuLiveSelectionIds(ctx) {
+      const live = contextMenuLiveCtx(ctx) || {}
+      const editor = live.editor || (ctx && ctx.editor) || {}
+      if (editor.selectedLayerIdsRef && Array.isArray(editor.selectedLayerIdsRef.current)) {
+        return editor.selectedLayerIdsRef.current.slice()
+      }
+      if (Array.isArray(editor.selectedLayerIds)) return editor.selectedLayerIds.slice()
+      return []
     }
 
     /**
@@ -6044,7 +6059,7 @@ window.__ModuleLoader__.load({
      * Item model: declarative rows, so groups/separators/shortcuts/icons stay data
      * ---------------------------------------------------------------------------------------- */
 
-    /** One actionable row: { id, label, shortcut?, icon?, disabled?, danger?, checked?, reason?, run }. */
+    /** One actionable row: { id, label, shortcut?, icon?, disabled?, danger?, checked?, reason?, title?, run }. */
     function contextMenuItem(id, label, options) {
       const extra = isObject(options) ? options : {}
       return {
@@ -6056,6 +6071,7 @@ window.__ModuleLoader__.load({
         danger: extra.danger === true,
         checked: extra.checked === true,
         reason: typeof extra.reason === 'string' ? extra.reason : '',
+        title: typeof extra.title === 'string' ? extra.title : '',
         run: typeof extra.run === 'function' ? extra.run : null,
       }
     }
@@ -6282,7 +6298,7 @@ window.__ModuleLoader__.load({
      */
     function contextMenuFrameSelection(ctx) {
       const editor = (ctx && ctx.editor) || {}
-      const selected = Array.isArray(editor.selectedLayerIds) ? editor.selectedLayerIds : []
+      const selected = contextMenuLiveSelectionIds(ctx)
       const roots =
         typeof editor.rootSelectionIds === 'function' ? editor.rootSelectionIds(selected) : selected.slice()
       if (!roots.length) {
@@ -6741,6 +6757,7 @@ window.__ModuleLoader__.load({
           shortcut: 'Ctrl/Cmd+Shift+]',
           icon: 'front',
           disabled: locked || typeof editor.arrangeSelection !== 'function',
+          reason: locked ? 'The layer is locked' : '',
           run: function () {
             return typeof editor.arrangeSelection === 'function' ? editor.arrangeSelection('front') : false
           },
@@ -6749,6 +6766,7 @@ window.__ModuleLoader__.load({
           shortcut: 'Ctrl/Cmd+]',
           icon: 'up',
           disabled: locked || typeof editor.arrangeSelection !== 'function',
+          reason: locked ? 'The layer is locked' : '',
           run: function () {
             return typeof editor.arrangeSelection === 'function'
               ? editor.arrangeSelection('forward')
@@ -6759,6 +6777,7 @@ window.__ModuleLoader__.load({
           shortcut: 'Ctrl/Cmd+[',
           icon: 'down',
           disabled: locked || typeof editor.arrangeSelection !== 'function',
+          reason: locked ? 'The layer is locked' : '',
           run: function () {
             return typeof editor.arrangeSelection === 'function'
               ? editor.arrangeSelection('backward')
@@ -6769,6 +6788,7 @@ window.__ModuleLoader__.load({
           shortcut: 'Ctrl/Cmd+Shift+[',
           icon: 'back',
           disabled: locked || typeof editor.arrangeSelection !== 'function',
+          reason: locked ? 'The layer is locked' : '',
           run: function () {
             return typeof editor.arrangeSelection === 'function' ? editor.arrangeSelection('back') : false
           },
@@ -6785,7 +6805,9 @@ window.__ModuleLoader__.load({
           title: multi ? 'Applies to every selected layer' : '',
           run: function () {
             if (typeof editor.toggleVisible !== 'function') return false
-            for (let index = 0; index < ids.length; index += 1) editor.toggleVisible(ids[index])
+            const liveIds = contextMenuLiveSelectionIds(ctx)
+            const targets = liveIds.length ? liveIds : ids
+            for (let index = 0; index < targets.length; index += 1) editor.toggleVisible(targets[index])
             return true
           },
         }),
@@ -6811,10 +6833,11 @@ window.__ModuleLoader__.load({
           disabled: !exportAvailable,
           reason: CONTEXT_MENU_COPY.exportUnavailable,
           run: function () {
+            const liveIds = contextMenuLiveSelectionIds(ctx)
             return contextMenuOpenExport(ctx, {
               scope: 'selection',
               artboardId: artboardId,
-              layerIds: ids.slice(),
+              layerIds: liveIds.length ? liveIds : ids.slice(),
             })
           },
         }),
@@ -7285,6 +7308,9 @@ window.__ModuleLoader__.load({
           function onKeyDown(event) {
             if (!event || event.key !== 'Escape') return
             if (typeof event.preventDefault === 'function') event.preventDefault()
+            // While the menu is open, Escape belongs to it: keep the shell (drawer) and the
+            // editor (deselect) from also reacting to the same key press.
+            if (typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation()
             if (typeof event.stopPropagation === 'function') event.stopPropagation()
             closeMenu(true, 'escape')
           }
@@ -7413,10 +7439,8 @@ window.__ModuleLoader__.load({
         const disabled = item.disabled === true
         const isActive = index === activeIndex
         const title = disabled
-          ? item.reason || item.label
-          : item.shortcut
-            ? item.label + ' (' + item.shortcut + ')'
-            : item.label
+          ? item.reason || item.title || item.label
+          : item.title || (item.shortcut ? item.label + ' (' + item.shortcut + ')' : item.label)
         rows.push(
           h(
             'button',
@@ -8675,7 +8699,6 @@ window.__ModuleLoader__.load({
 .dc-ks-foot-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .dc-ks-foot-key { flex: 0 0 auto; margin-left: auto; display: inline-flex; align-items: center; gap: 4px; }
 .dc-ks-foot-key .dc-ks-key { height: 17px; }
-.dc-spacer { flex: 1 1 auto; min-width: 4px; }
 @container dcpane (max-width: 560px) { .dc-ks-columns { grid-template-columns: minmax(0, 1fr); gap: 10px; } }
 @media (hover: hover) and (pointer: fine) { .dc-ks-row:hover { background: var(--dsw-alias-bg-layer-1, #f7f7f8); } .dc-ks-clear:hover { background: var(--dsw-alias-bg-layer-2, #f0f0f2); } }
 `
@@ -19754,13 +19777,17 @@ button.dct-badge { cursor: pointer; }
       }
 
       /**
-       * Scale every member about the union box the handles are drawn on. Members can have
-       * different parents, so the scale runs in artboard space and the parent offset is
-       * subtracted back out per patch.
+       * Scale every member about the union box the handles are drawn on.
+       *
+       * Everything here comes from geometry captured when the gesture started (`resizeMembers`
+       * plus `selectionBox`), never from the live document: the preview runs on every
+       * pointermove, so reading live rects would re-scale already-scaled layers and the
+       * selection would explode. Members can have different parents, so the scale happens in
+       * artboard space and each parent's offset is subtracted back out for its patch.
        */
       function resizeEntries(gesture, dx, dy) {
         const box = isObject(gesture.selectionBox) ? gesture.selectionBox : null
-        const members = Array.isArray(gesture.members) ? gesture.members : []
+        const members = Array.isArray(gesture.resizeMembers) ? gesture.resizeMembers : []
         if (!box || !members.length || !(box.width > 0) || !(box.height > 0)) return []
         const handle = String(gesture.handle || '')
         let left = box.x
@@ -19780,18 +19807,13 @@ button.dct-badge { cursor: pointer; }
         const out = []
         for (let index = 0; index < members.length; index += 1) {
           const member = members[index]
-          const node = nodeForLayer(member.layerId)
-          if (!node || !node.worldRect) continue
-          const parentNode = node.parent || null
-          const baseX = parentNode && parentNode.worldRect ? parentNode.worldRect.x : 0
-          const baseY = parentNode && parentNode.worldRect ? parentNode.worldRect.y : 0
           out.push({
             layerId: member.layerId,
             patch: {
-              x: Math.round(left + (node.worldRect.x - box.x) * scaleX - baseX),
-              y: Math.round(top + (node.worldRect.y - box.y) * scaleY - baseY),
-              width: Math.round(Math.max(MIN_LAYER_SIZE, node.worldRect.width * scaleX)),
-              height: Math.round(Math.max(MIN_LAYER_SIZE, node.worldRect.height * scaleY)),
+              x: Math.round(left + (member.x - box.x) * scaleX - member.baseX),
+              y: Math.round(top + (member.y - box.y) * scaleY - member.baseY),
+              width: Math.round(Math.max(MIN_LAYER_SIZE, member.width * scaleX)),
+              height: Math.round(Math.max(MIN_LAYER_SIZE, member.height * scaleY)),
             },
           })
         }
@@ -19896,6 +19918,21 @@ button.dct-badge { cursor: pointer; }
               return item.worldRect
             }),
           ) || rectOf(0, 0, 1, 1)
+        // Resize sessions scale from a snapshot: artboard-space rects of every member plus the
+        // parent offset each patch has to convert back into (see resizeEntries). Same reason the
+        // drag branch reads `member.origin` instead of the live layer.
+        const resizeMembers = movingNodes.map(function (item) {
+          const itemParent = item.parent || null
+          return {
+            layerId: item.id,
+            x: finiteNumber(item.worldRect.x, 0),
+            y: finiteNumber(item.worldRect.y, 0),
+            width: Math.max(0, finiteNumber(item.worldRect.width, 0)),
+            height: Math.max(0, finiteNumber(item.worldRect.height, 0)),
+            baseX: itemParent && itemParent.worldRect ? finiteNumber(itemParent.worldRect.x, 0) : 0,
+            baseY: itemParent && itemParent.worldRect ? finiteNumber(itemParent.worldRect.y, 0) : 0,
+          }
+        })
         gestureRef.current = {
           pointerId: event.pointerId,
           kind: handle
@@ -19922,7 +19959,10 @@ button.dct-badge { cursor: pointer; }
           },
           members: members,
           multi: members.length > 1,
-          selectionBox: unionBox || selectionBox,
+          // The exact model union of the members wins; the box the renderer drew (unionBox, read
+          // from `data-selection-bounds`) is device-pixel snapped and is only a fallback.
+          selectionBox: selectionBox || unionBox,
+          resizeMembers: resizeMembers,
           snapStatic: snapStatic,
           frameRect: frameRect,
           dx: null,
@@ -21777,7 +21817,6 @@ button.dct-badge { cursor: pointer; }
       moreTools: 'More tools',
       exportItem: 'Export…',
       exportUnavailable: 'Export is provided by the export extension',
-      shortcuts: 'Keyboard shortcuts',
       resetZoom: 'Reset zoom to 100%',
       fitSelection: 'Fit selection',
       zoomHeading: 'Zoom',
@@ -21808,19 +21847,6 @@ button.dct-badge { cursor: pointer; }
       { id: 'tablet', label: 'Tablet', width: 768, height: 1024 },
       { id: 'mobile', label: 'Mobile', width: 390, height: 844 },
       { id: 'square', label: 'Square', width: 1080, height: 1080 },
-    ]
-    const SHORTCUT_ROWS = [
-      { id: 'undo', label: 'Undo', keys: [MOD_LABEL, 'Z'] },
-      { id: 'redo', label: 'Redo', keys: [MOD_LABEL, SHIFT_LABEL, 'Z'] },
-      { id: 'duplicate', label: 'Duplicate selection', keys: [MOD_LABEL, 'D'] },
-      { id: 'nudge', label: 'Nudge 1 px', keys: ['←', '↑', '→', '↓'] },
-      { id: 'nudge-big', label: 'Nudge 10 px', keys: [SHIFT_LABEL, '↑'] },
-      { id: 'delete', label: 'Delete selection', keys: ['Del'] },
-      { id: 'comment', label: 'Comment on layer', keys: ['C'] },
-      { id: 'pan', label: 'Pan canvas', keys: ['Space', 'drag'] },
-      { id: 'zoom', label: 'Zoom canvas', keys: [MOD_LABEL, 'wheel'] },
-      { id: 'escape', label: 'Deselect / cancel', keys: ['Esc'] },
-      { id: 'send', label: 'Send comment', keys: [MOD_LABEL, 'Enter'] },
     ]
 
     /* ------------------------------------------------------------------------------------------
@@ -22114,31 +22140,6 @@ button.dct-badge { cursor: pointer; }
       )
     }
 
-    function ShortcutsDialog(props) {
-      return h(
-        ModalDialog,
-        { title: props.title, closeLabel: props.closeLabel, onClose: props.onClose },
-        h(
-          'div',
-          { className: 'dc-shortcut-list' },
-          SHORTCUT_ROWS.map(function (row) {
-            return h(
-              'div',
-              { className: 'dc-shortcut-row', key: row.id },
-              h('span', null, row.label),
-              h(
-                'span',
-                { className: 'dc-shortcut-keys' },
-                row.keys.map(function (key, index) {
-                  return h('kbd', { className: 'dc-kbd', key: key + '-' + index }, key)
-                }),
-              ),
-            )
-          }),
-        ),
-      )
-    }
-
     /* ------------------------------------------------------------------------------------------
      * Canvas root
      * ---------------------------------------------------------------------------------------- */
@@ -22267,9 +22268,6 @@ button.dct-badge { cursor: pointer; }
       const menu = menuState[0]
       const setMenu = menuState[1]
 
-      const shortcutsState = React.useState(false)
-      const shortcutsOpen = shortcutsState[0]
-      const setShortcutsOpen = shortcutsState[1]
 
       // Narrow sidebars (< NARROW_BREAKPOINT px) turn the panels into overlay drawers so the
       // canvas keeps the full width instead of shrinking to a postage stamp.
@@ -22288,6 +22286,10 @@ button.dct-badge { cursor: pointer; }
       spaceHeldMirrorRef.current = spaceHeld
 
       // Track the live body width so panel clamps react to the sidebar being resized.
+      // The dep is deliberately just "a document is loaded": a ResizeObserver fires once when it
+      // starts observing, so re-subscribing on every document change would re-run `measure`
+      // mid-gesture (which re-fits the camera and inflates a drag's screen-to-canvas delta).
+      const hasDocForMeasure = !!doc
       React.useLayoutEffect(
         function () {
           const node = bodyRef.current
@@ -22304,7 +22306,7 @@ button.dct-badge { cursor: pointer; }
             observer.disconnect()
           }
         },
-        [doc],
+        [hasDocForMeasure],
       )
 
       // Restore the persisted panel layout once the sidebar has a measurable width.
@@ -22339,7 +22341,9 @@ button.dct-badge { cursor: pointer; }
       )
 
       // Debounced refit when the canvas container changes size (splitters, sidebar resize,
-      // narrow <-> wide switch) — unless the user has framed the view themselves.
+      // narrow <-> wide switch) — unless the user has framed the view themselves. The dep is
+      // only "a document is loaded": a ResizeObserver fires once when it starts observing, so
+      // re-subscribing on every document change would re-fit the view after each edit.
       React.useEffect(
         function () {
           const node = canvasRef.current
@@ -22366,7 +22370,7 @@ button.dct-badge { cursor: pointer; }
             }
           }
         },
-        [doc, canvasRef],
+        [hasDocForMeasure],
       )
 
       // The canvas signals user intent: wheel zoom/pan and middle/space drag mark the camera
@@ -22643,7 +22647,9 @@ button.dct-badge { cursor: pointer; }
 
       function openShortcuts() {
         setMenu(null)
-        setShortcutsOpen(true)
+        // The registry in 47-shortcuts.js owns the one shortcuts sheet (searchable, grouped,
+        // platform-aware); this is the header-menu entry point.
+        if (typeof openShortcutsSheet === 'function') openShortcutsSheet()
       }
 
       const exportCommand =
@@ -23780,16 +23786,6 @@ button.dct-badge { cursor: pointer; }
                     onClose: closeMenu,
                   }),
             )
-          : null,
-        shortcutsOpen
-          ? h(ShortcutsDialog, {
-              key: 'shortcuts',
-              title: COPY.shortcuts,
-              closeLabel: strings.dismiss,
-              onClose: function () {
-                setShortcutsOpen(false)
-              },
-            })
           : null,
         // Full-app overlays registered by feature parts (export dialog, shortcuts sheet, …).
         renderExtensions(EXTENSIONS.appPanels, editorApi),

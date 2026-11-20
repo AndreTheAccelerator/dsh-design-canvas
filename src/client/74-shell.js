@@ -24,7 +24,6 @@
       moreTools: 'More tools',
       exportItem: 'Export…',
       exportUnavailable: 'Export is provided by the export extension',
-      shortcuts: 'Keyboard shortcuts',
       resetZoom: 'Reset zoom to 100%',
       fitSelection: 'Fit selection',
       zoomHeading: 'Zoom',
@@ -55,19 +54,6 @@
       { id: 'tablet', label: 'Tablet', width: 768, height: 1024 },
       { id: 'mobile', label: 'Mobile', width: 390, height: 844 },
       { id: 'square', label: 'Square', width: 1080, height: 1080 },
-    ]
-    const SHORTCUT_ROWS = [
-      { id: 'undo', label: 'Undo', keys: [MOD_LABEL, 'Z'] },
-      { id: 'redo', label: 'Redo', keys: [MOD_LABEL, SHIFT_LABEL, 'Z'] },
-      { id: 'duplicate', label: 'Duplicate selection', keys: [MOD_LABEL, 'D'] },
-      { id: 'nudge', label: 'Nudge 1 px', keys: ['←', '↑', '→', '↓'] },
-      { id: 'nudge-big', label: 'Nudge 10 px', keys: [SHIFT_LABEL, '↑'] },
-      { id: 'delete', label: 'Delete selection', keys: ['Del'] },
-      { id: 'comment', label: 'Comment on layer', keys: ['C'] },
-      { id: 'pan', label: 'Pan canvas', keys: ['Space', 'drag'] },
-      { id: 'zoom', label: 'Zoom canvas', keys: [MOD_LABEL, 'wheel'] },
-      { id: 'escape', label: 'Deselect / cancel', keys: ['Esc'] },
-      { id: 'send', label: 'Send comment', keys: [MOD_LABEL, 'Enter'] },
     ]
 
     /* ------------------------------------------------------------------------------------------
@@ -361,31 +347,6 @@
       )
     }
 
-    function ShortcutsDialog(props) {
-      return h(
-        ModalDialog,
-        { title: props.title, closeLabel: props.closeLabel, onClose: props.onClose },
-        h(
-          'div',
-          { className: 'dc-shortcut-list' },
-          SHORTCUT_ROWS.map(function (row) {
-            return h(
-              'div',
-              { className: 'dc-shortcut-row', key: row.id },
-              h('span', null, row.label),
-              h(
-                'span',
-                { className: 'dc-shortcut-keys' },
-                row.keys.map(function (key, index) {
-                  return h('kbd', { className: 'dc-kbd', key: key + '-' + index }, key)
-                }),
-              ),
-            )
-          }),
-        ),
-      )
-    }
-
     /* ------------------------------------------------------------------------------------------
      * Canvas root
      * ---------------------------------------------------------------------------------------- */
@@ -514,9 +475,6 @@
       const menu = menuState[0]
       const setMenu = menuState[1]
 
-      const shortcutsState = React.useState(false)
-      const shortcutsOpen = shortcutsState[0]
-      const setShortcutsOpen = shortcutsState[1]
 
       // Narrow sidebars (< NARROW_BREAKPOINT px) turn the panels into overlay drawers so the
       // canvas keeps the full width instead of shrinking to a postage stamp.
@@ -535,6 +493,10 @@
       spaceHeldMirrorRef.current = spaceHeld
 
       // Track the live body width so panel clamps react to the sidebar being resized.
+      // The dep is deliberately just "a document is loaded": a ResizeObserver fires once when it
+      // starts observing, so re-subscribing on every document change would re-run `measure`
+      // mid-gesture (which re-fits the camera and inflates a drag's screen-to-canvas delta).
+      const hasDocForMeasure = !!doc
       React.useLayoutEffect(
         function () {
           const node = bodyRef.current
@@ -551,7 +513,7 @@
             observer.disconnect()
           }
         },
-        [doc],
+        [hasDocForMeasure],
       )
 
       // Restore the persisted panel layout once the sidebar has a measurable width.
@@ -586,7 +548,9 @@
       )
 
       // Debounced refit when the canvas container changes size (splitters, sidebar resize,
-      // narrow <-> wide switch) — unless the user has framed the view themselves.
+      // narrow <-> wide switch) — unless the user has framed the view themselves. The dep is
+      // only "a document is loaded": a ResizeObserver fires once when it starts observing, so
+      // re-subscribing on every document change would re-fit the view after each edit.
       React.useEffect(
         function () {
           const node = canvasRef.current
@@ -613,7 +577,7 @@
             }
           }
         },
-        [doc, canvasRef],
+        [hasDocForMeasure],
       )
 
       // The canvas signals user intent: wheel zoom/pan and middle/space drag mark the camera
@@ -890,13 +854,9 @@
 
       function openShortcuts() {
         setMenu(null)
-        // The shortcuts registry (47-shortcuts.js) owns the one shortcuts sheet; the legacy
-        // dialog below only remains for a bundle that predates it.
-        if (typeof openShortcutsSheet === 'function') {
-          openShortcutsSheet()
-          return
-        }
-        setShortcutsOpen(true)
+        // The registry in 47-shortcuts.js owns the one shortcuts sheet (searchable, grouped,
+        // platform-aware); this is the header-menu entry point.
+        if (typeof openShortcutsSheet === 'function') openShortcutsSheet()
       }
 
       const exportCommand =
@@ -2033,16 +1993,6 @@
                     onClose: closeMenu,
                   }),
             )
-          : null,
-        shortcutsOpen
-          ? h(ShortcutsDialog, {
-              key: 'shortcuts',
-              title: COPY.shortcuts,
-              closeLabel: strings.dismiss,
-              onClose: function () {
-                setShortcutsOpen(false)
-              },
-            })
           : null,
         // Full-app overlays registered by feature parts (export dialog, shortcuts sheet, …).
         renderExtensions(EXTENSIONS.appPanels, editorApi),

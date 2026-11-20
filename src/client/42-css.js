@@ -242,9 +242,6 @@
 .dc-modal { display: flex; flex-direction: column; gap: 10px; width: 100%; max-width: 340px; max-height: 100%; overflow: auto; padding: 14px; background: var(--dsw-alias-bg-overlay, #ffffff); border: 1px solid var(--dsw-alias-border-l1, #e3e4e8); border-radius: 8px; box-shadow: 0 24px 48px rgba(15, 23, 42, 0.28); }
 .dc-modal-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .dc-modal-title { font-size: 13px; font-weight: 600; color: var(--dsw-alias-label-primary, #1a1c21); }
-.dc-shortcut-list { display: flex; flex-direction: column; gap: 6px; }
-.dc-shortcut-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-size: 12px; color: var(--dsw-alias-label-secondary, #6b7280); }
-.dc-shortcut-keys { display: inline-flex; align-items: center; gap: 4px; flex: 0 0 auto; }
 .dc-kbd { display: inline-flex; align-items: center; min-height: 18px; padding: 0 5px; border: 1px solid var(--dsw-alias-border-l1, #e3e4e8); border-bottom-width: 2px; border-radius: 4px; background: var(--dsw-alias-bg-layer-1, #f7f7f8); font-size: 11px; color: var(--dsw-alias-label-secondary, #6b7280); }
 
 /* ------------------------------------------------------------------ narrow container adaptations */

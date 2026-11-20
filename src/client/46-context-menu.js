@@ -51,13 +51,16 @@
 
     const CONTEXT_MENU_CSS = `
 .dc-ctxmenu { position: fixed; z-index: 80; box-sizing: border-box; display: flex; flex-direction: column; gap: 1px; min-width: min(200px, calc(100cqw - 12px)); max-width: min(280px, calc(100cqw - 12px)); padding: 4px; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; background: var(--dsw-alias-bg-overlay, #ffffff); border: 1px solid var(--dsw-alias-border-l1, #e3e4e8); border-radius: 8px; box-shadow: 0 12px 32px rgba(15, 23, 42, 0.2), 0 2px 6px rgba(15, 23, 42, 0.08); font-size: 12px; }
-.dc-ctxmenu:focus { outline: none; }
+.dc-ctxmenu:focus:not(:focus-visible) { outline: none; }
 .dc-ctxmenu:focus-visible { outline: 2px solid var(--dsw-alias-brand-primary, #3b82f6); outline-offset: 2px; }
 .dcm-head { flex: 0 0 auto; max-width: 100%; padding: 3px 8px 5px; margin-bottom: 2px; border-bottom: 1px solid var(--dsw-alias-border-l1, #e3e4e8); font-size: 10.5px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: var(--dsw-alias-label-secondary, #6b7280); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .dc-ctxmenu .dc-menu-item { flex: 0 0 auto; }
 .dc-ctxmenu .dc-menu-sep { flex: 0 0 auto; }
 .dc-ctxmenu .dc-menu-item[aria-disabled="true"] { opacity: 0.45; cursor: default; }
-.dc-ctxmenu .dc-menu-item[aria-disabled="true"]:hover { background: transparent; }
+/* A disabled row stays transparent even under a pointer; hover only exists on fine pointers. */
+@media (hover: hover) and (pointer: fine) {
+  .dc-ctxmenu .dc-menu-item[aria-disabled="true"]:hover { background: transparent; }
+}
 .dc-ctxmenu .dc-menu-item.dcm-active:not([aria-disabled="true"]) { background: var(--dsw-alias-bg-layer-2, #f0f0f2); }
 @media (prefers-reduced-motion: no-preference) {
   .dc-ctxmenu { animation: dcm-in 90ms ease-out; }
@@ -75,6 +78,21 @@
 
     function contextMenuLiveCtx(fallback) {
       return CONTEXT_MENU_STATE.liveCtx || fallback || null
+    }
+
+    /**
+     * The selection as it is NOW. Menu rows are built before the right-click's selection has been
+     * committed to React state, so actions must read the editor's synchronous ref, never the
+     * snapshot the row was built from.
+     */
+    function contextMenuLiveSelectionIds(ctx) {
+      const live = contextMenuLiveCtx(ctx) || {}
+      const editor = live.editor || (ctx && ctx.editor) || {}
+      if (editor.selectedLayerIdsRef && Array.isArray(editor.selectedLayerIdsRef.current)) {
+        return editor.selectedLayerIdsRef.current.slice()
+      }
+      if (Array.isArray(editor.selectedLayerIds)) return editor.selectedLayerIds.slice()
+      return []
     }
 
     /**
@@ -365,7 +383,7 @@
      */
     function contextMenuFrameSelection(ctx) {
       const editor = (ctx && ctx.editor) || {}
-      const selected = Array.isArray(editor.selectedLayerIds) ? editor.selectedLayerIds : []
+      const selected = contextMenuLiveSelectionIds(ctx)
       const roots =
         typeof editor.rootSelectionIds === 'function' ? editor.rootSelectionIds(selected) : selected.slice()
       if (!roots.length) {
@@ -872,7 +890,9 @@
           title: multi ? 'Applies to every selected layer' : '',
           run: function () {
             if (typeof editor.toggleVisible !== 'function') return false
-            for (let index = 0; index < ids.length; index += 1) editor.toggleVisible(ids[index])
+            const liveIds = contextMenuLiveSelectionIds(ctx)
+            const targets = liveIds.length ? liveIds : ids
+            for (let index = 0; index < targets.length; index += 1) editor.toggleVisible(targets[index])
             return true
           },
         }),
@@ -898,10 +918,11 @@
           disabled: !exportAvailable,
           reason: CONTEXT_MENU_COPY.exportUnavailable,
           run: function () {
+            const liveIds = contextMenuLiveSelectionIds(ctx)
             return contextMenuOpenExport(ctx, {
               scope: 'selection',
               artboardId: artboardId,
-              layerIds: ids.slice(),
+              layerIds: liveIds.length ? liveIds : ids.slice(),
             })
           },
         }),
