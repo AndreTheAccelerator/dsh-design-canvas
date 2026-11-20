@@ -294,3 +294,119 @@ test('export can target a selection (objects, not only artboards)', () => {
   const fallback = JSON.parse(t.renderExport(doc, 'json', { scope: 'selection', layerIds: [] }))
   assert.equal(fallback.artboards[0].layers.length, 3, 'no selection falls back to the whole board')
 })
+
+// A pill button: CSS renders border-radius:999px as a stadium because it scales all radii down
+// together; SVG clamps rx/ry independently, which used to turn these into ellipses ("buttons
+// turn into ovals in the PNG", since the PNG is rasterised from this SVG).
+test('svg export clamps a pill radius instead of emitting an ellipse', () => {
+  const doc = {
+    schemaVersion: 1,
+    name: 'Pills',
+    version: 1,
+    updatedAt: '2026-01-01T00:00:00.000Z',
+    artboards: [{
+      id: 'ab-1', name: 'Board', x: 0, y: 0, width: 400, height: 200, background: '#ffffff',
+      layers: [
+        { id: 'l-btn', type: 'frame', name: 'Button', x: 10, y: 10, width: 116, height: 38, fill: '#0b1220', radius: 999 },
+        { id: 'l-round', type: 'rect', name: 'Dot', x: 200, y: 10, width: 40, height: 40, fill: '#2563eb', radius: 999 },
+      ],
+    }],
+    comments: [],
+  }
+  const svg = t.renderSvg(doc, {})
+  assert.ok(!svg.includes('rx="999"'), 'no unclamped radius reaches the SVG')
+  assert.ok(svg.includes('rx="19"') && svg.includes('ry="19"'), '116x38 pill uses half the short side (19)')
+  assert.ok(svg.includes('rx="20"') && svg.includes('ry="20"'), '40x40 box is a circle (20)')
+})
+
+// A layout-less frame describes how its OWN children are placed. As a flex child it must stay in
+// flow (and become the containing block for its absolute children), otherwise it is drawn at 0,0
+// on top of its siblings -- which is how the exported HTML lost the hero copy.
+test('html export keeps a layout-less flex child in flow', () => {
+  const doc = {
+    schemaVersion: 1,
+    name: 'Flex',
+    version: 1,
+    updatedAt: '2026-01-01T00:00:00.000Z',
+    artboards: [{
+      id: 'ab-1', name: 'Board', x: 0, y: 0, width: 800, height: 400, background: '#ffffff',
+      layers: [
+        {
+          id: 'l-row', type: 'frame', name: 'Row', x: 0, y: 0, width: 800, height: 400,
+          layout: { direction: 'row', gap: 40, align: 'center', justify: 'space-between' },
+          children: [
+            { id: 'l-copy', type: 'text', name: 'Copy', x: 0, y: 0, width: 300, height: 60, text: 'Hello', fontSize: 40 },
+            {
+              id: 'l-art', type: 'frame', name: 'Art', x: 0, y: 0, width: 300, height: 300, fill: '#eef2ff',
+              layout: null,
+              children: [
+                { id: 'l-card', type: 'rect', name: 'Card', x: 20, y: 30, width: 100, height: 50, fill: '#ffffff' },
+              ],
+            },
+          ],
+        },
+      ],
+    }],
+    comments: [],
+  }
+  const html = t.renderHtml(doc, {})
+  // the layout-less frame is a flex item: relative (containing block), never absolute at 0,0
+  const artStyle = /<div style="([^"]*)"[^>]*>\s*<div style="[^"]*100px;height:50px/.exec(html)
+  assert.ok(artStyle, 'the art frame is rendered')
+  const style = artStyle[1]
+  assert.ok(!style.includes('position:absolute'), 'a flex child is not absolutely positioned: ' + style)
+  assert.ok(style.includes('position:relative'), 'a flex child with absolute children is a containing block: ' + style)
+  // its absolute child keeps a parent-relative offset, not an artboard-scale one
+  assert.match(html, /left:20px;top:30px/, 'the child keeps its authored offset inside the frame')
+})
+
+// The SVG text wrapper must use real glyph measurement when the platform can provide it, so a
+// label is not split just because a crude character estimate says it does not fit.
+test('svg text wraps with measured advances when a measurer is available', () => {
+  if (typeof t.setExportTextMeasurer !== 'function' || typeof t.resetExportTextMetrics !== 'function') {
+    return
+  }
+  const doc = {
+    schemaVersion: 1,
+    name: 'Text',
+    version: 1,
+    updatedAt: '2026-01-01T00:00:00.000Z',
+    artboards: [
+      {
+        id: 'ab-1',
+        name: 'Board',
+        x: 0,
+        y: 0,
+        width: 400,
+        height: 200,
+        background: '#ffffff',
+        layers: [
+          // 52 px wide: the real advance of "Sign in" at 15 px is ~48 px, so it fits on one line.
+          { id: 'l-signin', type: 'text', name: 'Sign in', x: 0, y: 0, width: 52, height: 22, text: 'Sign in', fontSize: 15 },
+          // far too narrow for its words: measured wrapping must still break it
+          { id: 'l-long', type: 'text', name: 'Long', x: 0, y: 40, width: 40, height: 60, text: 'alpha beta', fontSize: 15 },
+        ],
+      },
+    ],
+    comments: [],
+  }
+
+  // A measurer that reports 0.46em per glyph — close to a real UI sans at 15 px.
+  t.setExportTextMeasurer(function (value, font) {
+    const size = font && Number.isFinite(font.size) ? font.size : 16
+    return String(value).length * size * 0.46
+  })
+  let svg
+  try {
+    svg = t.renderSvg(doc, {})
+  } finally {
+    t.resetExportTextMetrics()
+  }
+
+  assert.ok(!svg.includes('>Sign</tspan>'), 'a label that fits is not split in two')
+  assert.ok(svg.includes('>Sign in</tspan>'), 'the label stays on one line')
+  assert.ok(svg.includes('>alpha</tspan>'), 'a genuinely too-wide label still wraps')
+
+  // Without a measurer the renderer must not throw (pure Node / SSR path).
+  assert.doesNotThrow(() => t.renderSvg(doc, {}))
+})

@@ -301,8 +301,17 @@
 
       const children = Array.isArray(layer.children) ? layer.children : []
       if (layer.type === 'frame') {
+        // `layer.layout === null` describes how this frame positions ITS OWN children, not how it
+        // sits in its parent. A layout-less frame that is a flex child is still a flex item, so
+        // `exportSizeStyle` must keep deciding absolute vs. in-flow (it already did).
         Object.assign(style, exportLayoutCss(layer.layout))
-        if (layer.layout === null || layer.layout === undefined) style.position = style.position || 'absolute'
+      }
+      // A static box is not a containing block, so absolute children of a layout-less container
+      // would resolve against the artboard and land in the wrong place. Make it relative.
+      const absoluteChildren =
+        (layer.type === 'frame' && !isObject(layer.layout)) || layer.type === 'group'
+      if (absoluteChildren && children.length && inFlex && !style.position) {
+        style.position = 'relative'
       }
       if (!children.length) {
         return line('<div style="' + cssDeclaration(style) + '"></div>')
@@ -562,6 +571,13 @@
         })
       }
       const children = Array.isArray(layer.children) ? layer.children : []
+      // A static box is not a containing block, so absolute children of a layout-less container
+      // would resolve against the artboard and land in the wrong place. Make it relative.
+      const absoluteChildren =
+        (layer.type === 'frame' && !isObject(layer.layout)) || layer.type === 'group'
+      if (absoluteChildren && children.length && inFlex && !style.position) {
+        style.position = 'relative'
+      }
       if (!children.length) return line('<div style=' + jsxStyle(style) + ' />')
       const childFlex = layer.type === 'frame' && isObject(layer.layout)
       const computedChildren = Array.isArray(node.children) ? node.children : []
@@ -647,25 +663,102 @@
      * SVG + PNG (pixel-true: computed geometry)
      * ---------------------------------------------------------------------------------------- */
 
-    /** Approximate word wrap for SVG text (no canvas measuring available in a pure renderer). */
-    function wrapSvgText(text, fontSize, width) {
+    /**
+     * Corner radius usable by SVG. CSS `border-radius` scales every radius down uniformly when the
+     * radii cannot fit (`border-radius:999px` on a 116x38 box renders a pill), while SVG clamps
+     * `rx` and `ry` independently — `rx=ry=999` becomes rx=58/ry=19, i.e. an ELLIPSE. Clamping to
+     * half the short side reproduces the CSS pill instead.
+     */
+    function svgRadius(layer, width, height) {
+      const radius = Math.max(0, finiteNumber(layer.radius, 0))
+      if (!(radius > 0)) return 0
+      const limit = Math.min(Math.max(0, finiteNumber(width, 0)), Math.max(0, finiteNumber(height, 0))) / 2
+      return roundTo(Math.min(radius, limit), 2)
+    }
+
+    /**
+     * Text measuring for wrapping. The browser can measure real glyph advances, so the SVG export
+     * wraps exactly where the canvas does; a pure Node renderer falls back to an estimate.
+     */
+    const EXPORT_TEXT_METRICS = { context: null, cache: null, override: null }
+
+    function exportTextMetrics() {
+      if (EXPORT_TEXT_METRICS.context !== null) return EXPORT_TEXT_METRICS.context || null
+      let context = null
+      try {
+        if (typeof document !== 'undefined' && typeof document.createElement === 'function') {
+          const canvas = document.createElement('canvas')
+          context = canvas && typeof canvas.getContext === 'function' ? canvas.getContext('2d') : null
+        }
+      } catch (error) {
+        context = null
+      }
+      EXPORT_TEXT_METRICS.context = context
+      return context
+    }
+
+    /** Width of `text` in px, or null when no measuring backend exists (Node). */
+    function measureExportText(text, font) {
+      const value = String(text === undefined || text === null ? '' : text)
+      if (!value) return 0
+      // Tests (and any host with its own metrics) can supply the measurer directly.
+      if (typeof EXPORT_TEXT_METRICS.override === 'function') {
+        const width = EXPORT_TEXT_METRICS.override(value, font)
+        return typeof width === 'number' && Number.isFinite(width) ? width : null
+      }
+      const context = exportTextMetrics()
+      if (!context) return null
+      const key =
+        font.size + '|' + font.weight + '|' + font.family + '|' + finiteNumber(font.letterSpacing, 0) + '|' + value
+      if (!EXPORT_TEXT_METRICS.cache) EXPORT_TEXT_METRICS.cache = new Map()
+      const cache = EXPORT_TEXT_METRICS.cache
+      const hit = cache.get(key)
+      if (hit !== undefined) return hit
+      let width = 0
+      try {
+        context.font =
+          String(font.weight || 400) + ' ' + font.size + 'px ' + String(font.family || DEFAULT_FONT)
+        width = context.measureText(value).width
+        const spacing = finiteNumber(font.letterSpacing, 0)
+        if (spacing) width += spacing * Math.max(1, value.length - 1)
+      } catch (error) {
+        width = 0
+      }
+      if (cache.size > 4000) cache.clear()
+      cache.set(key, width)
+      return width
+    }
+
+    /**
+     * Word wrap for SVG <text>. Honours authored newlines; a line only breaks when the measured
+     * advance exceeds the layer's box, so a label like "Sign in" in a 52 px box stays on one line.
+     */
+    function wrapSvgText(text, font, width) {
       const source = String(text === undefined || text === null ? '' : text)
-      if (!width || width <= 0) return source.split('\n')
-      const averageGlyph = Math.max(1, fontSize * 0.52)
-      const maxChars = Math.max(1, Math.floor(width / averageGlyph))
+      const fontSize = Math.max(1, finiteNumber(font && font.size, 16))
+      const measured = measureExportText(source, font) !== null
+      const available = Math.max(0, finiteNumber(width, 0))
+      const glyph = Math.max(1, fontSize * 0.52)
       const out = []
       source.split('\n').forEach(function (paragraph) {
         if (!paragraph) {
           out.push('')
           return
         }
+        const fits = function (candidate) {
+          if (!available) return true
+          if (measured) return measureExportText(candidate, font) <= available
+          return candidate.length <= Math.max(1, Math.floor(available / glyph))
+        }
         let current = ''
         paragraph.split(/\s+/).forEach(function (word) {
+          if (!word) return
           if (!current) {
             current = word
             return
           }
-          if ((current + ' ' + word).length <= maxChars) current += ' ' + word
+          const candidate = current + ' ' + word
+          if (fits(candidate)) current = candidate
           else {
             out.push(current)
             current = word
@@ -673,7 +766,7 @@
         })
         if (current) out.push(current)
       })
-      return out
+      return out.length ? out : ['']
     }
 
     function renderSvgText(layer, node) {
@@ -686,7 +779,16 @@
       const y = roundTo(finiteNumber(rect.y, 0), 2)
       const anchor = align === 'center' ? 'middle' : align === 'right' ? 'end' : 'start'
       const textX = align === 'center' ? roundTo(x + width / 2, 2) : align === 'right' ? roundTo(x + width, 2) : x
-      const lines = wrapSvgText(layer.text, fontSize, width)
+      const lines = wrapSvgText(
+        layer.text,
+        {
+          size: fontSize,
+          weight: finiteNumber(layer.fontWeight, 400),
+          family: layer.fontFamily || DEFAULT_FONT,
+          letterSpacing: finiteNumber(layer.letterSpacing, 0),
+        },
+        width,
+      )
       const tspans = lines
         .map(function (line, index) {
           return (
@@ -882,12 +984,12 @@
         )
       }
       if (layer.type === 'image' && typeof layer.src === 'string' && layer.src) {
-        const radius = Math.max(0, finiteNumber(layer.radius, 0))
+        const radius = svgRadius(layer, width, height)
         const clipId = radius > 0 ? 'dc-imgclip-' + String(layer.id).replace(/[^A-Za-z0-9_-]/g, '') : ''
         if (clipId) {
           defs.push(
             '<clipPath id="' + clipId + '"><rect x="' + x + '" y="' + y + '" width="' + roundTo(width, 2) +
-              '" height="' + roundTo(height, 2) + '" rx="' + radius + '" /></clipPath>',
+              '" height="' + roundTo(height, 2) + '" rx="' + radius + '" ry="' + radius + '" /></clipPath>',
           )
         }
         return (
@@ -915,7 +1017,7 @@
       }
 
       // rect / frame / group: a (rounded) rect at absolute coordinates plus recursive children.
-      const radius = Math.max(0, finiteNumber(layer.radius, 0))
+      const radius = svgRadius(layer, width, height)
       const paint = svgPaint(layer.fill, layer.id)
       if (paint.def) defs.push(paint.def)
       const borderWidth = Math.max(0, finiteNumber(layer.borderWidth, 0))
@@ -923,7 +1025,8 @@
       if (clipId) {
         defs.push(
           '<clipPath id="' + clipId + '"><rect x="' + x + '" y="' + y + '" width="' + roundTo(width, 2) +
-            '" height="' + roundTo(height, 2) + '" rx="' + radius + '" /></clipPath>',
+            '" height="' + roundTo(height, 2) + '"' +
+            (radius > 0 ? ' rx="' + radius + '" ry="' + radius + '"' : '') + ' /></clipPath>',
         )
       }
       const hasPaint = paint.paint !== 'none' || borderWidth > 0

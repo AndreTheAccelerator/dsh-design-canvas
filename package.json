@@ -1,6 +1,6 @@
 {
   "name": "@andretaccelerator/dsh-design-canvas",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "private": true,
   "description": "Chat-paired design canvas for the DeepSeek Harness Web UI: artboards, multi-select, groups, lines, CSS-like auto-layout, inline element comments (single or batch), agent-revisable ops, and export to code/SVG/PNG",
   "license": "MIT",

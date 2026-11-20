@@ -188,6 +188,23 @@
       surface.renderExport = typeof renderExport === 'function' ? renderExport : null
       surface.exportFileInfo = typeof exportFileInfo === 'function' ? exportFileInfo : null
       surface.sanitizeFileName = typeof sanitizeFileName === 'function' ? sanitizeFileName : null
+      surface.wrapSvgText = typeof wrapSvgText === 'function' ? wrapSvgText : null
+      // Lets a test install (or drop) a text-measuring backend and re-probe it.
+      surface.resetExportTextMetrics =
+        typeof EXPORT_TEXT_METRICS === 'object' && EXPORT_TEXT_METRICS
+          ? function () {
+              EXPORT_TEXT_METRICS.context = null
+              EXPORT_TEXT_METRICS.cache = null
+              EXPORT_TEXT_METRICS.override = null
+            }
+          : null
+      surface.setExportTextMeasurer =
+        typeof EXPORT_TEXT_METRICS === 'object' && EXPORT_TEXT_METRICS
+          ? function (measurer) {
+              EXPORT_TEXT_METRICS.override = typeof measurer === 'function' ? measurer : null
+              EXPORT_TEXT_METRICS.cache = null
+            }
+          : null
       return surface
     }
 

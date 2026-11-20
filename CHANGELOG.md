@@ -1,5 +1,42 @@
 ﻿# Changelog
 
+## 2.1.1 — 2026-11-20
+
+Export fidelity fixes found by exporting the Northwind mockup. All three were in the browser half
+(`src/client/43-export-code.js`); the document model and the Host half are unchanged.
+
+### SVG / PNG
+
+* **Pill buttons rendered as ellipses.** The SVG writer emitted the authored `radius` verbatim, so a
+  button authored with `radius: 999` became `<rect rx="999" ry="999">`. SVG clamps `rx` and `ry`
+  independently, which yields rx = width/2 and ry = height/2 — an *ellipse*. CSS `border-radius`
+  does the opposite: it scales every radius down uniformly, which is why the canvas showed a
+  stadium. Radii are now clamped to half the short side (and the same clamp feeds the clip paths),
+  so `116×38 → 19`, `148×44 → 22`, `178×48 → 24`: pills again, in SVG and in the PNG rasterised
+  from it.
+* **Labels split in the middle of a phrase.** `"Sign in"` in a 52 px box became two `<tspan>`s
+  because wrapping used a fixed "0.52 em per character" estimate instead of real advances. The
+  export now measures with a 2D canvas context (cached per font/text) and only breaks a line when
+  the *measured* width overflows; the estimate remains as the fallback for a pure Node renderer.
+
+### HTML
+
+* **Sections went missing.** A frame with `layout: null` was always emitted as
+  `position: absolute` — even when it was a **flex child** of an auto-layout parent. `layout: null`
+  only says how that frame positions *its own* children. In the mockup the hero's art panel landed
+  at `left: 0` on top of the hero copy, hiding the headline, subhead and both buttons behind the
+  gradient panel. Flex children are now left in flow (the parent layout places them).
+* **Inner content escaped its container.** With the panel back in flow it became `position: static`,
+  which is not a containing block, so its absolutely-positioned children resolved against the
+  artboard and drifted (the "Live board" card sat over the headline). A layout-less container now
+  gets `position: relative` when it is in flow, so its children keep their authored offsets.
+
+Tests: **13 client tests** (was 10) — a pill-radius case, a layout-less-flex-child case and a
+measured-wrapping case (which uses a newly exported `setExportTextMeasurer` seam so the browser
+path is covered in Node).
+
+﻿# Changelog
+
 ## 2.1.0 — 2026-11-20
 
 The editor-feedback release: everything here came from using the v2 canvas on real work. The
