@@ -71,18 +71,25 @@ with it).
 | Ctrl/Cmd + wheel · trackpad pinch | Zoom about the cursor (10 %–400 %) |
 | Wheel · Shift + wheel | Scroll the canvas vertically / horizontally |
 | Header zoom −, %, + · `Shift+1` · `Shift+2` | Zoom out / fit artboards / zoom in · Fit · Fit selection |
-| Click layer · Shift/Ctrl/Cmd + click · drag empty background | Select · add/remove from selection · marquee select |
+﻿| Click layer · Shift/Ctrl/Cmd + click · drag empty background | Select · add/remove from selection · marquee select (it may start outside the artboards and select across them) |
+| Double-click a nested layer | Deep select: reach the layer under the pointer through any number of frames/groups |
 | Enter · Escape (with a selection) | Drill into a frame/group · step out, then clear |
+| Right-click a layer, artboard or the empty canvas | Context menu (copy/paste/duplicate/delete/rename, comment, group, arrange, lock, hide, copy as PNG/SVG, export) |
 | Drag / 8 handles | Move / resize the whole selection (auto-layout children reorder instead) |
 | Alt + drag | Duplicate while dragging (Alt also disables snapping) |
 | Arrow keys · Shift + arrows | Nudge 1 px / 10 px (batched, whole selection) |
-| Ctrl/Cmd + A · C · X · V | Select all · copy · cut · paste (into the selected container) |
+| Ctrl/Cmd + A · C · X · V · D | Select all · copy · cut · paste (into the selected container) · duplicate |
 | Ctrl/Cmd + G · Ctrl/Cmd + Shift + G | Group selection · ungroup |
 | Ctrl/Cmd + ] / [ · + Shift | Bring forward / send backward · to front / to back |
 | Ctrl/Cmd + Shift + arrows · Ctrl/Cmd + Shift + H / V | Align selection · distribute horizontally / vertically |
-| Ctrl/Cmd + D · Delete / Backspace | Duplicate · delete |
+| Delete / Backspace · Ctrl/Cmd + Shift + Backspace | Delete the selection (or the artboard when only it is selected) · delete the artboard |
 | Ctrl/Cmd + Z · Ctrl/Cmd + Shift + Z or Ctrl + Y | Undo / redo (last 50 edits, comments excluded) |
-| `c` · `Alt+C` · `Ctrl/Cmd + Shift + E` | Comment composer · comments panel · export dialog |
+| `V` `R` `O` `T` `F` `L` `B` `I` `C` | Select · rectangle · ellipse · text · frame · line · button · image · comment mode |
+| `Ctrl/Cmd + 0` / `1` / `2` · `+` `=` `-` | Zoom 100 % · fit artboards · fit selection · zoom in/out |
+| `Alt+1` / `Alt+2` / `Alt+3` · `Alt+C` · `Ctrl/Cmd + Shift + E` | Layers panel · inspector · export dialog · comments panel · export dialog |
+| `Tab` / `Shift+Tab` · `Ctrl/Cmd + Enter` | Next / previous sibling · select parent |
+| `Ctrl/Cmd + Shift + L` · `Alt+Shift + H` | Lock / unlock the selection · hide / show it |
+| `?` | Keyboard shortcuts sheet (searchable; also in the toolbar and the command menu) |
 | Double-click a tree row or artboard name | Rename that layer / artboard inline |
 
 ## Layers, frames, groups and auto layout
@@ -179,9 +186,17 @@ dialog that previews the generated output before you copy or download it:
 | **PNG** | Raster of the artboard at 1×–4×, rendered from the vector export so text stays sharp. |
 | **JSON** | The document model for that artboard — exactly what `design_read` returns. |
 
-Scope can be the current artboard, all artboards, or the current selection; the file name is
-pre-filled from the design/artboard name and sanitised per OS. The dialog also shows the output
-size and offers **Copy code** and **Download**.
+Scope can be the current artboard, all artboards, or **the current selection**. A selection is
+exported by re-rooting it into a synthetic document sized to its bounding box, so the output is
+only the selected layers, at the position they render at — including layers that live inside an
+auto-layout frame. That makes "export these three cards" a first-class action rather than a
+crop of the artboard. The file name is pre-filled from the design/artboard name (or `selection`)
+and sanitised per OS. The dialog also shows the output size and offers **Copy code** and
+**Download**.
+
+The right-click context menu exposes the same machinery without the dialog: **Copy as PNG** and
+**Copy as SVG** put the selected objects on the clipboard directly (`copySelectionAs(format)` in
+the client API also accepts `html`, `react` and `json`).
 
 ## Panels and window layout
 

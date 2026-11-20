@@ -1,5 +1,62 @@
-# Changelog
+﻿# Changelog
 
+## 2.1.0 — 2026-11-20
+
+The editor-feedback release: everything here came from using the v2 canvas on real work. The
+Host half is untouched (the model, the ops and the HTTP surface are still 2.0.0); this is the
+browser half catching up with how the canvas is actually used.
+
+### Interaction
+
+* **Toasts instead of a banner.** Transient messages used to be an inline banner above the stage,
+  so every refusal shifted the toolbar and the canvas down. They now float over the bottom of the
+  panel (`role="status"`, auto-dismiss after ~5 s, hover pauses, close button) and the shell has
+  no banner block left.
+* **Deep select.** A double-click now selects the layer under the pointer even when it is buried
+  in several frames/groups — one gesture instead of one per level. Double-clicking a container's
+  own background descends to the child under the cursor, and the clicks that follow stay inside
+  that scope.
+* **Marquee from anywhere.** A left drag on the empty canvas draws a selection rectangle even
+  when it starts outside every artboard, and it selects across artboards (each board gets its own
+  union box). Space-drag and middle-drag still pan.
+* **Selection chrome.** One strong blue (`#0d99ff`) union box around the whole selection with 8
+  white/blue handles, plus thin outlines on each member. Stroke and handles stay a constant
+  screen size at any zoom (they are computed in canvas units from the zoom), edges snap to device
+  pixels, and a handle drag scales every member about the union box.
+* **Multi-selection resize.** Handles used to belong to the primary layer only; they now scale
+  the whole selection in artboard space and subtract each member's parent offset back out.
+
+### Commands and chrome
+
+* **Right-click context menu** for layers, artboards and the empty canvas: copy/cut/paste/
+  duplicate/delete/rename, add comment, enter selection, group/ungroup, frame selection, arrange
+  (front/forward/backward/back), lock, hide, copy as PNG/SVG, export. Inapplicable items are
+  disabled with a reason, the menu flips when it would leave the panel, and arrows/Enter/Esc work.
+* **Keyboard shortcuts.** A single registry feeds a searchable sheet (`?`, a toolbar button, or
+  the command menu) and installs the bindings through `EXTENSIONS.keys`, so tool keys
+  (`V R O T F L B I C`), `Ctrl/Cmd+0/1/2`, `+`/`=`/`-`, `Alt+1/2/3`, `Tab`/`Shift+Tab`,
+  `Ctrl/Cmd+Enter`, `Ctrl/Cmd+Shift+L`, `Alt+Shift+H` and `Ctrl/Cmd+Shift+Backspace` never fight
+  the editor's own keys. Bindings are gated on canvas focus or pointer position.
+* **Artboards are deletable.** A trash button on the artboard row in the layers panel, `Delete`
+  when only an artboard is selected, the context menu, and
+  `Ctrl/Cmd+Shift+Backspace`. Undo restores the artboard and re-inserts its layers.
+
+### Export
+
+* **Objects, not only artboards.** `renderExport` and the export dialog accept a selection and
+  re-root it into a synthetic document sized to the selection's bounding box, so HTML, React, SVG,
+  PNG and JSON all export just the selected layers at their rendered positions (auto-layout
+  children included). `copySelectionAs()` puts SVG/PNG/HTML/React/JSON on the clipboard for the
+  context menu, and the dialog names the file after the selection.
+* Client tests: **10** (was 9), adding a selection-export case that pins the union box, the
+  re-based layer offsets and the empty-selection fallback.
+
+### Structure
+
+* The browser half grows from 24 to **27 parts**: `46-context-menu.js`, `47-shortcuts.js` and
+  `48-toast.js`, all built on the v2 extension registries
+  (`registerAppPanel`/`registerToolbar`/`registerKeyHandler`/`registerCommand`), so none of them
+  needs a shell edit.
 ## 2.0.0 — 2026-11-20
 
 The "make it a design tool" release: multi-selection, groups, lines, a real layout vocabulary,

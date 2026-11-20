@@ -3036,10 +3036,57 @@
           }
           return entries
         }
-        // Resize handles belong to the primary layer only.
+        // Resize handles sit on the union box of the selection: scale every member about it.
         const patch = gesturePatch(gesture, dx, dy)
-        if (patch) entries.push({ layerId: gesture.layerId, patch: patch })
-        return entries
+        if (patch && gesture.members.length <= 1) {
+          entries.push({ layerId: gesture.layerId, patch: patch })
+          return entries
+        }
+        return resizeEntries(gesture, dx, dy)
+      }
+
+      /**
+       * Scale every member about the union box the handles are drawn on.
+       *
+       * Everything here comes from geometry captured when the gesture started (`resizeMembers`
+       * plus `selectionBox`), never from the live document: the preview runs on every
+       * pointermove, so reading live rects would re-scale already-scaled layers and the
+       * selection would explode. Members can have different parents, so the scale happens in
+       * artboard space and each parent's offset is subtracted back out for its patch.
+       */
+      function resizeEntries(gesture, dx, dy) {
+        const box = isObject(gesture.selectionBox) ? gesture.selectionBox : null
+        const members = Array.isArray(gesture.resizeMembers) ? gesture.resizeMembers : []
+        if (!box || !members.length || !(box.width > 0) || !(box.height > 0)) return []
+        const handle = String(gesture.handle || '')
+        let left = box.x
+        let top = box.y
+        let width = box.width
+        let height = box.height
+        if (handle.indexOf('e') >= 0) width = box.width + dx
+        if (handle.indexOf('w') >= 0) width = box.width - dx
+        if (handle.indexOf('s') >= 0) height = box.height + dy
+        if (handle.indexOf('n') >= 0) height = box.height - dy
+        width = Math.max(MIN_LAYER_SIZE, width)
+        height = Math.max(MIN_LAYER_SIZE, height)
+        if (handle.indexOf('w') >= 0) left = box.x + box.width - width
+        if (handle.indexOf('n') >= 0) top = box.y + box.height - height
+        const scaleX = width / box.width
+        const scaleY = height / box.height
+        const out = []
+        for (let index = 0; index < members.length; index += 1) {
+          const member = members[index]
+          out.push({
+            layerId: member.layerId,
+            patch: {
+              x: Math.round(left + (member.x - box.x) * scaleX - member.baseX),
+              y: Math.round(top + (member.y - box.y) * scaleY - member.baseY),
+              width: Math.round(Math.max(MIN_LAYER_SIZE, member.width * scaleX)),
+              height: Math.round(Math.max(MIN_LAYER_SIZE, member.height * scaleY)),
+            },
+          })
+        }
+        return out
       }
 
       function cancelGestureFrame() {
@@ -3076,7 +3123,7 @@
         applyDocLocal(docPatchLayers(current, entries))
       }
 
-      function beginGesture(event, node, handle) {
+      function beginGesture(event, node, handle, unionBox) {
         if (!node || !isObject(node.layer)) return
         if (event.pointerType === 'mouse' && event.button !== 0) return
         if (spaceHeldRef.current || isMiddlePointer(event)) return
@@ -3093,8 +3140,9 @@
           return
         }
         const selectedIds = selectedLayerIdsRef.current
-        const multi =
-          !handle && !autoParent && selectedIds.length > 1 && selectedIds.indexOf(found.layer.id) >= 0
+        // A handle sits on the union box of the WHOLE selection, so a handle drag must carry
+        // every member, not only the primary layer.
+        const multi = !autoParent && selectedIds.length > 1 && selectedIds.indexOf(found.layer.id) >= 0
         const collected = gestureMembersFor(found.layer.id, multi)
         const members = collected.members
         if (members.length === 0) {
@@ -3139,6 +3187,21 @@
               return item.worldRect
             }),
           ) || rectOf(0, 0, 1, 1)
+        // Resize sessions scale from a snapshot: artboard-space rects of every member plus the
+        // parent offset each patch has to convert back into (see resizeEntries). Same reason the
+        // drag branch reads `member.origin` instead of the live layer.
+        const resizeMembers = movingNodes.map(function (item) {
+          const itemParent = item.parent || null
+          return {
+            layerId: item.id,
+            x: finiteNumber(item.worldRect.x, 0),
+            y: finiteNumber(item.worldRect.y, 0),
+            width: Math.max(0, finiteNumber(item.worldRect.width, 0)),
+            height: Math.max(0, finiteNumber(item.worldRect.height, 0)),
+            baseX: itemParent && itemParent.worldRect ? finiteNumber(itemParent.worldRect.x, 0) : 0,
+            baseY: itemParent && itemParent.worldRect ? finiteNumber(itemParent.worldRect.y, 0) : 0,
+          }
+        })
         gestureRef.current = {
           pointerId: event.pointerId,
           kind: handle
@@ -3165,7 +3228,10 @@
           },
           members: members,
           multi: members.length > 1,
-          selectionBox: selectionBox,
+          // The exact model union of the members wins; the box the renderer drew (unionBox, read
+          // from `data-selection-bounds`) is device-pixel snapped and is only a fallback.
+          selectionBox: selectionBox || unionBox,
+          resizeMembers: resizeMembers,
           snapStatic: snapStatic,
           frameRect: frameRect,
           dx: null,
@@ -3239,7 +3305,20 @@
         const layerId = selectedLayerIdRef.current
         const node = tree && layerId && tree.byId ? tree.byId.get(layerId) || null : null
         if (!node) return
-        beginGesture(event, node, handle)
+        // The renderer draws ONE union box for the whole selection (60-render.js SelectionBox) and
+        // publishes its rect in artboard canvas units on the box element.
+        let unionBox = null
+        const target = event && event.currentTarget
+        const boxEl =
+          target && typeof target.closest === 'function' ? target.closest('.dc-sel-box') : null
+        if (boxEl) {
+          try {
+            unionBox = JSON.parse(boxEl.getAttribute('data-selection-bounds') || 'null')
+          } catch (error) {
+            unionBox = null
+          }
+        }
+        beginGesture(event, node, handle, unionBox)
       }
 
       /**

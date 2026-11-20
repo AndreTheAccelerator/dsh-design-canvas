@@ -427,25 +427,17 @@
       {
         id: 'nudge-small',
         group: 'Selection',
-        keys: ['↑', '↓', '←', '→'],
+        keys: ['↑↓←→'],
         label: 'Nudge 1 px',
         owner: 'Editor',
       },
       {
         id: 'nudge-large',
         group: 'Selection',
-        keys: ['Shift+↑', 'Shift+↓', 'Shift+←', 'Shift+→'],
+        keys: ['Shift+↑↓←→'],
         label: 'Nudge 10 px',
         owner: 'Editor',
       },
-      {
-        id: 'comment-on-layer',
-        group: 'Selection',
-        keys: ['Ctrl/Cmd+Enter'],
-        label: 'Send a comment (while typing)',
-        owner: 'Composer',
-      },
-
       /* ------------------------------- Edit ------------------------------- */
       {
         id: 'undo',
@@ -567,7 +559,7 @@
       {
         id: 'align-selection',
         group: 'Arrange',
-        keys: ['Ctrl/Cmd+Shift+←', 'Ctrl/Cmd+Shift+→', 'Ctrl/Cmd+Shift+↑', 'Ctrl/Cmd+Shift+↓'],
+        keys: ['Ctrl/Cmd+Shift+↑↓←→'],
         label: 'Align selection',
         owner: 'Selection bar',
       },
@@ -1178,8 +1170,9 @@
 .dc-ks-group { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
 .dc-ks-group-title { margin: 0 0 4px; font-size: 10px; font-weight: 650; letter-spacing: 0.08em; text-transform: uppercase; color: var(--dsw-alias-label-secondary, #6b7280); }
 .dc-ks-row { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; min-width: 0; padding: 3px 6px; border-radius: 5px; }
-.dc-ks-label { min-width: 0; font-size: 11.5px; line-height: 1.45; color: var(--dsw-alias-label-primary, #111827); }
+.dc-ks-label { flex: 1 1 auto; min-width: 88px; font-size: 11.5px; line-height: 1.45; color: var(--dsw-alias-label-primary, #111827); }
 .dc-ks-note { margin-left: 5px; font-size: 9.5px; letter-spacing: 0.02em; color: var(--dsw-alias-label-secondary, #6b7280); opacity: 0.75; white-space: nowrap; }
+.dc-ks-keylist { display: inline-flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 3px; flex: 0 1 auto; min-width: 0; }
 .dc-ks-keys { display: inline-flex; align-items: center; gap: 3px; flex: 0 0 auto; }
 .dc-ks-or { flex: 0 0 auto; padding: 0 1px; font-size: 10px; color: var(--dsw-alias-label-secondary, #6b7280); opacity: 0.65; }
 .dc-ks-key { display: inline-flex; align-items: center; justify-content: center; min-width: 18px; height: 19px; padding: 0 5px; border: 1px solid var(--dsw-alias-border-l1, #e5e7eb); border-bottom-width: 2px; border-radius: 5px; background: var(--dsw-alias-bg-layer-1, #f7f7f8); color: var(--dsw-alias-label-secondary, #6b7280); font-family: inherit; font-size: 10.5px; line-height: 1; white-space: nowrap; }
@@ -1190,7 +1183,6 @@
 .dc-ks-foot-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .dc-ks-foot-key { flex: 0 0 auto; margin-left: auto; display: inline-flex; align-items: center; gap: 4px; }
 .dc-ks-foot-key .dc-ks-key { height: 17px; }
-.dc-spacer { flex: 1 1 auto; min-width: 4px; }
 @container dcpane (max-width: 560px) { .dc-ks-columns { grid-template-columns: minmax(0, 1fr); gap: 10px; } }
 @media (hover: hover) and (pointer: fine) { .dc-ks-row:hover { background: var(--dsw-alias-bg-layer-1, #f7f7f8); } .dc-ks-clear:hover { background: var(--dsw-alias-bg-layer-2, #f0f0f2); } }
 `
@@ -1222,7 +1214,7 @@
         if (index > 0) nodes.push(h('span', { className: 'dc-ks-or', key: 'or-' + String(index) }, '/'))
         nodes.push(h('span', { className: 'dc-ks-keys', key: 'chord-' + String(index) }, shortcutKeycaps(chords[index])))
       }
-      return nodes
+      return h('span', { className: 'dc-ks-keylist' }, nodes)
     }
 
     /** Everything a search word may match: label, group, owner, hint and the printed keys. */
@@ -1531,7 +1523,7 @@
     }
 
     registerAppPanel({
-      id: 'shortcuts-sheet',
+      id: 'shortcuts-sheet-panel',
       render: function (ctx) {
         return h(ShortcutsSheet, { key: 'shortcuts-sheet', ctx: ctx })
       },

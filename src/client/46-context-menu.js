@@ -50,7 +50,7 @@
     }
 
     const CONTEXT_MENU_CSS = `
-.dc-ctxmenu { position: fixed; z-index: 80; box-sizing: border-box; display: flex; flex-direction: column; gap: 1px; min-width: 200px; max-width: 280px; padding: 4px; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; background: var(--dsw-alias-bg-overlay, #ffffff); border: 1px solid var(--dsw-alias-border-l1, #e3e4e8); border-radius: 8px; box-shadow: 0 12px 32px rgba(15, 23, 42, 0.2), 0 2px 6px rgba(15, 23, 42, 0.08); font-size: 12px; }
+.dc-ctxmenu { position: fixed; z-index: 80; box-sizing: border-box; display: flex; flex-direction: column; gap: 1px; min-width: min(200px, calc(100cqw - 12px)); max-width: min(280px, calc(100cqw - 12px)); padding: 4px; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; background: var(--dsw-alias-bg-overlay, #ffffff); border: 1px solid var(--dsw-alias-border-l1, #e3e4e8); border-radius: 8px; box-shadow: 0 12px 32px rgba(15, 23, 42, 0.2), 0 2px 6px rgba(15, 23, 42, 0.08); font-size: 12px; }
 .dc-ctxmenu:focus { outline: none; }
 .dc-ctxmenu:focus-visible { outline: 2px solid var(--dsw-alias-brand-primary, #3b82f6); outline-offset: 2px; }
 .dcm-head { flex: 0 0 auto; max-width: 100%; padding: 3px 8px 5px; margin-bottom: 2px; border-bottom: 1px solid var(--dsw-alias-border-l1, #e3e4e8); font-size: 10.5px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: var(--dsw-alias-label-secondary, #6b7280); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -126,7 +126,7 @@
      * Item model: declarative rows, so groups/separators/shortcuts/icons stay data
      * ---------------------------------------------------------------------------------------- */
 
-    /** One actionable row: { id, label, shortcut?, icon?, disabled?, danger?, checked?, reason?, run }. */
+    /** One actionable row: { id, label, shortcut?, icon?, disabled?, danger?, checked?, reason?, title?, run }. */
     function contextMenuItem(id, label, options) {
       const extra = isObject(options) ? options : {}
       return {
@@ -138,6 +138,7 @@
         danger: extra.danger === true,
         checked: extra.checked === true,
         reason: typeof extra.reason === 'string' ? extra.reason : '',
+        title: typeof extra.title === 'string' ? extra.title : '',
         run: typeof extra.run === 'function' ? extra.run : null,
       }
     }
@@ -823,6 +824,7 @@
           shortcut: 'Ctrl/Cmd+Shift+]',
           icon: 'front',
           disabled: locked || typeof editor.arrangeSelection !== 'function',
+          reason: locked ? 'The layer is locked' : '',
           run: function () {
             return typeof editor.arrangeSelection === 'function' ? editor.arrangeSelection('front') : false
           },
@@ -831,6 +833,7 @@
           shortcut: 'Ctrl/Cmd+]',
           icon: 'up',
           disabled: locked || typeof editor.arrangeSelection !== 'function',
+          reason: locked ? 'The layer is locked' : '',
           run: function () {
             return typeof editor.arrangeSelection === 'function'
               ? editor.arrangeSelection('forward')
@@ -841,6 +844,7 @@
           shortcut: 'Ctrl/Cmd+[',
           icon: 'down',
           disabled: locked || typeof editor.arrangeSelection !== 'function',
+          reason: locked ? 'The layer is locked' : '',
           run: function () {
             return typeof editor.arrangeSelection === 'function'
               ? editor.arrangeSelection('backward')
@@ -851,6 +855,7 @@
           shortcut: 'Ctrl/Cmd+Shift+[',
           icon: 'back',
           disabled: locked || typeof editor.arrangeSelection !== 'function',
+          reason: locked ? 'The layer is locked' : '',
           run: function () {
             return typeof editor.arrangeSelection === 'function' ? editor.arrangeSelection('back') : false
           },
@@ -1168,11 +1173,12 @@
         panel = null
       }
       if (panel && panel.width > 40 && panel.height > 40) {
+        // Never leave the visible viewport, even when the panel itself is scrolled partly out.
         bounds = {
-          left: panel.left + margin,
-          top: panel.top + margin,
-          right: panel.right - margin,
-          bottom: panel.bottom - margin,
+          left: Math.max(margin, panel.left + margin),
+          top: Math.max(margin, panel.top + margin),
+          right: Math.min(viewportWidth - margin, panel.right - margin),
+          bottom: Math.min(viewportHeight - margin, panel.bottom - margin),
         }
       }
       if (bounds.right - bounds.left < 120 || bounds.bottom - bounds.top < 120) {
@@ -1232,11 +1238,12 @@
       const setActiveIndex = selectedActive[1]
       activeRef.current = activeIndex
 
-      const closeMenu = React.useCallback(function (restoreFocus) {
+      const closeMenu = React.useCallback(function (restoreFocus, reason) {
         const previous = previousFocusRef.current
         previousFocusRef.current = null
         setMenu(null)
         setActiveIndex(-1)
+        beacon('context-menu-close', { reason: String(reason || 'unknown') })
         if (restoreFocus === false || !previous) return
         try {
           if (previous.isConnected !== false && typeof previous.focus === 'function') {
@@ -1255,7 +1262,7 @@
         function (item) {
           if (!item || item.separator || item.disabled || typeof item.run !== 'function') return
           const run = item.run
-          closeMenu(true)
+          closeMenu(true, 'run:' + String(item.id || 'item'))
           let outcome = null
           try {
             outcome = run()
@@ -1350,29 +1357,32 @@
           }
           function onPointerDown(event) {
             if (targetInside(event)) return
-            closeMenu(true)
+            closeMenu(true, 'outside-pointerdown')
           }
           function onWheel(event) {
             const node = menuRef.current
             // Let a long menu scroll its own list instead of closing on the first notch.
             if (targetInside(event) && node && node.scrollHeight > node.clientHeight + 1) return
-            closeMenu(false)
+            closeMenu(false, 'wheel')
           }
           function onScroll(event) {
             if (targetInside(event)) return
-            closeMenu(false)
+            closeMenu(false, 'scroll')
           }
           function onKeyDown(event) {
             if (!event || event.key !== 'Escape') return
             if (typeof event.preventDefault === 'function') event.preventDefault()
+            // While the menu is open, Escape belongs to it: keep the shell (drawer) and the
+            // editor (deselect) from also reacting to the same key press.
+            if (typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation()
             if (typeof event.stopPropagation === 'function') event.stopPropagation()
-            closeMenu(true)
+            closeMenu(true, 'escape')
           }
           function onResize() {
-            closeMenu(false)
+            closeMenu(false, 'resize')
           }
           function onWindowBlur() {
-            closeMenu(false)
+            closeMenu(false, 'blur')
           }
           document.addEventListener('pointerdown', onPointerDown, true)
           document.addEventListener('wheel', onWheel, { capture: true, passive: true })
@@ -1447,7 +1457,7 @@
         if (key === 'Escape' || key === 'Tab') {
           if (typeof event.preventDefault === 'function') event.preventDefault()
           if (typeof event.stopPropagation === 'function') event.stopPropagation()
-          closeMenu(true)
+          closeMenu(true, key === 'Tab' ? 'tab' : 'escape-key')
           return
         }
         if (key === 'Enter' || key === ' ' || key === 'Spacebar') {
@@ -1493,10 +1503,8 @@
         const disabled = item.disabled === true
         const isActive = index === activeIndex
         const title = disabled
-          ? item.reason || item.label
-          : item.shortcut
-            ? item.label + ' (' + item.shortcut + ')'
-            : item.label
+          ? item.reason || item.title || item.label
+          : item.title || (item.shortcut ? item.label + ' (' + item.shortcut + ')' : item.label)
         rows.push(
           h(
             'button',

@@ -890,6 +890,12 @@
 
       function openShortcuts() {
         setMenu(null)
+        // The shortcuts registry (47-shortcuts.js) owns the one shortcuts sheet; the legacy
+        // dialog below only remains for a bundle that predates it.
+        if (typeof openShortcutsSheet === 'function') {
+          openShortcutsSheet()
+          return
+        }
         setShortcutsOpen(true)
       }
 

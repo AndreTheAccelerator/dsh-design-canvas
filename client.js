@@ -7086,11 +7086,12 @@ window.__ModuleLoader__.load({
         panel = null
       }
       if (panel && panel.width > 40 && panel.height > 40) {
+        // Never leave the visible viewport, even when the panel itself is scrolled partly out.
         bounds = {
-          left: panel.left + margin,
-          top: panel.top + margin,
-          right: panel.right - margin,
-          bottom: panel.bottom - margin,
+          left: Math.max(margin, panel.left + margin),
+          top: Math.max(margin, panel.top + margin),
+          right: Math.min(viewportWidth - margin, panel.right - margin),
+          bottom: Math.min(viewportHeight - margin, panel.bottom - margin),
         }
       }
       if (bounds.right - bounds.left < 120 || bounds.bottom - bounds.top < 120) {
@@ -7150,11 +7151,12 @@ window.__ModuleLoader__.load({
       const setActiveIndex = selectedActive[1]
       activeRef.current = activeIndex
 
-      const closeMenu = React.useCallback(function (restoreFocus) {
+      const closeMenu = React.useCallback(function (restoreFocus, reason) {
         const previous = previousFocusRef.current
         previousFocusRef.current = null
         setMenu(null)
         setActiveIndex(-1)
+        beacon('context-menu-close', { reason: String(reason || 'unknown') })
         if (restoreFocus === false || !previous) return
         try {
           if (previous.isConnected !== false && typeof previous.focus === 'function') {
@@ -7173,7 +7175,7 @@ window.__ModuleLoader__.load({
         function (item) {
           if (!item || item.separator || item.disabled || typeof item.run !== 'function') return
           const run = item.run
-          closeMenu(true)
+          closeMenu(true, 'run:' + String(item.id || 'item'))
           let outcome = null
           try {
             outcome = run()
@@ -7268,29 +7270,29 @@ window.__ModuleLoader__.load({
           }
           function onPointerDown(event) {
             if (targetInside(event)) return
-            closeMenu(true)
+            closeMenu(true, 'outside-pointerdown')
           }
           function onWheel(event) {
             const node = menuRef.current
             // Let a long menu scroll its own list instead of closing on the first notch.
             if (targetInside(event) && node && node.scrollHeight > node.clientHeight + 1) return
-            closeMenu(false)
+            closeMenu(false, 'wheel')
           }
           function onScroll(event) {
             if (targetInside(event)) return
-            closeMenu(false)
+            closeMenu(false, 'scroll')
           }
           function onKeyDown(event) {
             if (!event || event.key !== 'Escape') return
             if (typeof event.preventDefault === 'function') event.preventDefault()
             if (typeof event.stopPropagation === 'function') event.stopPropagation()
-            closeMenu(true)
+            closeMenu(true, 'escape')
           }
           function onResize() {
-            closeMenu(false)
+            closeMenu(false, 'resize')
           }
           function onWindowBlur() {
-            closeMenu(false)
+            closeMenu(false, 'blur')
           }
           document.addEventListener('pointerdown', onPointerDown, true)
           document.addEventListener('wheel', onWheel, { capture: true, passive: true })
@@ -7365,7 +7367,7 @@ window.__ModuleLoader__.load({
         if (key === 'Escape' || key === 'Tab') {
           if (typeof event.preventDefault === 'function') event.preventDefault()
           if (typeof event.stopPropagation === 'function') event.stopPropagation()
-          closeMenu(true)
+          closeMenu(true, key === 'Tab' ? 'tab' : 'escape-key')
           return
         }
         if (key === 'Enter' || key === ' ' || key === 'Spacebar') {
@@ -7917,25 +7919,17 @@ window.__ModuleLoader__.load({
       {
         id: 'nudge-small',
         group: 'Selection',
-        keys: ['↑', '↓', '←', '→'],
+        keys: ['↑↓←→'],
         label: 'Nudge 1 px',
         owner: 'Editor',
       },
       {
         id: 'nudge-large',
         group: 'Selection',
-        keys: ['Shift+↑', 'Shift+↓', 'Shift+←', 'Shift+→'],
+        keys: ['Shift+↑↓←→'],
         label: 'Nudge 10 px',
         owner: 'Editor',
       },
-      {
-        id: 'comment-on-layer',
-        group: 'Selection',
-        keys: ['Ctrl/Cmd+Enter'],
-        label: 'Send a comment (while typing)',
-        owner: 'Composer',
-      },
-
       /* ------------------------------- Edit ------------------------------- */
       {
         id: 'undo',
@@ -8057,7 +8051,7 @@ window.__ModuleLoader__.load({
       {
         id: 'align-selection',
         group: 'Arrange',
-        keys: ['Ctrl/Cmd+Shift+←', 'Ctrl/Cmd+Shift+→', 'Ctrl/Cmd+Shift+↑', 'Ctrl/Cmd+Shift+↓'],
+        keys: ['Ctrl/Cmd+Shift+↑↓←→'],
         label: 'Align selection',
         owner: 'Selection bar',
       },
@@ -8668,8 +8662,9 @@ window.__ModuleLoader__.load({
 .dc-ks-group { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
 .dc-ks-group-title { margin: 0 0 4px; font-size: 10px; font-weight: 650; letter-spacing: 0.08em; text-transform: uppercase; color: var(--dsw-alias-label-secondary, #6b7280); }
 .dc-ks-row { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; min-width: 0; padding: 3px 6px; border-radius: 5px; }
-.dc-ks-label { min-width: 0; font-size: 11.5px; line-height: 1.45; color: var(--dsw-alias-label-primary, #111827); }
+.dc-ks-label { flex: 1 1 auto; min-width: 88px; font-size: 11.5px; line-height: 1.45; color: var(--dsw-alias-label-primary, #111827); }
 .dc-ks-note { margin-left: 5px; font-size: 9.5px; letter-spacing: 0.02em; color: var(--dsw-alias-label-secondary, #6b7280); opacity: 0.75; white-space: nowrap; }
+.dc-ks-keylist { display: inline-flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 3px; flex: 0 1 auto; min-width: 0; }
 .dc-ks-keys { display: inline-flex; align-items: center; gap: 3px; flex: 0 0 auto; }
 .dc-ks-or { flex: 0 0 auto; padding: 0 1px; font-size: 10px; color: var(--dsw-alias-label-secondary, #6b7280); opacity: 0.65; }
 .dc-ks-key { display: inline-flex; align-items: center; justify-content: center; min-width: 18px; height: 19px; padding: 0 5px; border: 1px solid var(--dsw-alias-border-l1, #e5e7eb); border-bottom-width: 2px; border-radius: 5px; background: var(--dsw-alias-bg-layer-1, #f7f7f8); color: var(--dsw-alias-label-secondary, #6b7280); font-family: inherit; font-size: 10.5px; line-height: 1; white-space: nowrap; }
@@ -8712,7 +8707,7 @@ window.__ModuleLoader__.load({
         if (index > 0) nodes.push(h('span', { className: 'dc-ks-or', key: 'or-' + String(index) }, '/'))
         nodes.push(h('span', { className: 'dc-ks-keys', key: 'chord-' + String(index) }, shortcutKeycaps(chords[index])))
       }
-      return nodes
+      return h('span', { className: 'dc-ks-keylist' }, nodes)
     }
 
     /** Everything a search word may match: label, group, owner, hint and the printed keys. */
@@ -9021,7 +9016,7 @@ window.__ModuleLoader__.load({
     }
 
     registerAppPanel({
-      id: 'shortcuts-sheet',
+      id: 'shortcuts-sheet-panel',
       render: function (ctx) {
         return h(ShortcutsSheet, { key: 'shortcuts-sheet', ctx: ctx })
       },
@@ -19749,10 +19744,58 @@ button.dct-badge { cursor: pointer; }
           }
           return entries
         }
-        // Resize handles belong to the primary layer only.
+        // Resize handles sit on the union box of the selection: scale every member about it.
         const patch = gesturePatch(gesture, dx, dy)
-        if (patch) entries.push({ layerId: gesture.layerId, patch: patch })
-        return entries
+        if (patch && gesture.members.length <= 1) {
+          entries.push({ layerId: gesture.layerId, patch: patch })
+          return entries
+        }
+        return resizeEntries(gesture, dx, dy)
+      }
+
+      /**
+       * Scale every member about the union box the handles are drawn on. Members can have
+       * different parents, so the scale runs in artboard space and the parent offset is
+       * subtracted back out per patch.
+       */
+      function resizeEntries(gesture, dx, dy) {
+        const box = isObject(gesture.selectionBox) ? gesture.selectionBox : null
+        const members = Array.isArray(gesture.members) ? gesture.members : []
+        if (!box || !members.length || !(box.width > 0) || !(box.height > 0)) return []
+        const handle = String(gesture.handle || '')
+        let left = box.x
+        let top = box.y
+        let width = box.width
+        let height = box.height
+        if (handle.indexOf('e') >= 0) width = box.width + dx
+        if (handle.indexOf('w') >= 0) width = box.width - dx
+        if (handle.indexOf('s') >= 0) height = box.height + dy
+        if (handle.indexOf('n') >= 0) height = box.height - dy
+        width = Math.max(MIN_LAYER_SIZE, width)
+        height = Math.max(MIN_LAYER_SIZE, height)
+        if (handle.indexOf('w') >= 0) left = box.x + box.width - width
+        if (handle.indexOf('n') >= 0) top = box.y + box.height - height
+        const scaleX = width / box.width
+        const scaleY = height / box.height
+        const out = []
+        for (let index = 0; index < members.length; index += 1) {
+          const member = members[index]
+          const node = nodeForLayer(member.layerId)
+          if (!node || !node.worldRect) continue
+          const parentNode = node.parent || null
+          const baseX = parentNode && parentNode.worldRect ? parentNode.worldRect.x : 0
+          const baseY = parentNode && parentNode.worldRect ? parentNode.worldRect.y : 0
+          out.push({
+            layerId: member.layerId,
+            patch: {
+              x: Math.round(left + (node.worldRect.x - box.x) * scaleX - baseX),
+              y: Math.round(top + (node.worldRect.y - box.y) * scaleY - baseY),
+              width: Math.round(Math.max(MIN_LAYER_SIZE, node.worldRect.width * scaleX)),
+              height: Math.round(Math.max(MIN_LAYER_SIZE, node.worldRect.height * scaleY)),
+            },
+          })
+        }
+        return out
       }
 
       function cancelGestureFrame() {
@@ -19789,7 +19832,7 @@ button.dct-badge { cursor: pointer; }
         applyDocLocal(docPatchLayers(current, entries))
       }
 
-      function beginGesture(event, node, handle) {
+      function beginGesture(event, node, handle, unionBox) {
         if (!node || !isObject(node.layer)) return
         if (event.pointerType === 'mouse' && event.button !== 0) return
         if (spaceHeldRef.current || isMiddlePointer(event)) return
@@ -19806,8 +19849,9 @@ button.dct-badge { cursor: pointer; }
           return
         }
         const selectedIds = selectedLayerIdsRef.current
-        const multi =
-          !handle && !autoParent && selectedIds.length > 1 && selectedIds.indexOf(found.layer.id) >= 0
+        // A handle sits on the union box of the WHOLE selection, so a handle drag must carry
+        // every member, not only the primary layer.
+        const multi = !autoParent && selectedIds.length > 1 && selectedIds.indexOf(found.layer.id) >= 0
         const collected = gestureMembersFor(found.layer.id, multi)
         const members = collected.members
         if (members.length === 0) {
@@ -19878,7 +19922,7 @@ button.dct-badge { cursor: pointer; }
           },
           members: members,
           multi: members.length > 1,
-          selectionBox: selectionBox,
+          selectionBox: unionBox || selectionBox,
           snapStatic: snapStatic,
           frameRect: frameRect,
           dx: null,
@@ -19952,7 +19996,20 @@ button.dct-badge { cursor: pointer; }
         const layerId = selectedLayerIdRef.current
         const node = tree && layerId && tree.byId ? tree.byId.get(layerId) || null : null
         if (!node) return
-        beginGesture(event, node, handle)
+        // The renderer draws ONE union box for the whole selection (60-render.js SelectionBox) and
+        // publishes its rect in artboard canvas units on the box element.
+        let unionBox = null
+        const target = event && event.currentTarget
+        const boxEl =
+          target && typeof target.closest === 'function' ? target.closest('.dc-sel-box') : null
+        if (boxEl) {
+          try {
+            unionBox = JSON.parse(boxEl.getAttribute('data-selection-bounds') || 'null')
+          } catch (error) {
+            unionBox = null
+          }
+        }
+        beginGesture(event, node, handle, unionBox)
       }
 
       /**
