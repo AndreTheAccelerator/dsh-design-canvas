@@ -35,10 +35,15 @@
       return artboard && Array.isArray(artboard.layers) ? artboard.layers : []
     }
 
-    /** Children array of any container: an artboard (`layers`) or a frame (`children`). */
+    /** True when a layer owns children (a frame with or without auto layout, or a group). */
+    function isContainerLayer(layer) {
+      return isObject(layer) && (layer.type === 'frame' || layer.type === 'group')
+    }
+
+    /** Children array of any container: an artboard (`layers`), a frame or a group (`children`). */
     function childrenOf(container) {
       if (!isObject(container)) return []
-      if (container.type === 'frame') {
+      if (isContainerLayer(container)) {
         return Array.isArray(container.children) ? container.children : []
       }
       return layersOf(container)
@@ -68,7 +73,7 @@
             depth: depth,
           }
         }
-        if (layer.type === 'frame') {
+        if (isContainerLayer(layer)) {
           const found = findLayerInList(childrenOf(layer), layerId, artboard, layer, depth + 1)
           if (found) return found
         }
@@ -89,10 +94,32 @@
       return null
     }
 
+    /**
+     * Cheap identity check between two in-memory documents: same board, ignoring `version`.
+     * Used by the poller to notice that the Host replaced/reset the document even though the
+     * version number did not move forward (Reset doc, adopting another workspace's board).
+     */
+    function sameDocumentIdentity(first, second) {
+      if (!isObject(first) || !isObject(second)) return first === second
+      if (String(first.updatedAt || '') !== String(second.updatedAt || '')) return false
+      if (String(first.name || '') !== String(second.name || '')) return false
+      const boardsA = artboardsOf(first)
+      const boardsB = artboardsOf(second)
+      if (boardsA.length !== boardsB.length) return false
+      for (let index = 0; index < boardsA.length; index += 1) {
+        const a = boardsA[index]
+        const b = boardsB[index]
+        if (!isObject(a) || !isObject(b)) return false
+        if (a.id !== b.id) return false
+        if (layersOf(a).length !== layersOf(b).length) return false
+      }
+      return true
+    }
+
     function collectLayerIds(layer, target) {
       if (!isObject(layer) || !(target instanceof Set)) return target
       if (typeof layer.id === 'string' && layer.id) target.add(layer.id)
-      if (layer.type === 'frame') {
+      if (isContainerLayer(layer)) {
         const kids = childrenOf(layer)
         for (let index = 0; index < kids.length; index += 1) collectLayerIds(kids[index], target)
       }
@@ -102,7 +129,7 @@
     function subtreeContains(layer, layerId) {
       if (!isObject(layer) || typeof layerId !== 'string' || !layerId) return false
       if (layer.id === layerId) return true
-      if (layer.type !== 'frame') return false
+      if (!isContainerLayer(layer)) return false
       const kids = childrenOf(layer)
       for (let index = 0; index < kids.length; index += 1) {
         if (subtreeContains(kids[index], layerId)) return true
@@ -110,9 +137,9 @@
       return false
     }
 
-    /** Nested-frame height of a subtree (a leaf layer is 1, matching Host depth rules). */
+    /** Nested-container height of a subtree (a leaf layer is 1, matching Host depth rules). */
     function subtreeHeight(layer) {
-      if (!isObject(layer) || layer.type !== 'frame') return 1
+      if (!isObject(layer) || !isContainerLayer(layer)) return 1
       let tallest = 0
       const kids = childrenOf(layer)
       for (let index = 0; index < kids.length; index += 1) {
@@ -130,7 +157,7 @@
           const layer = layers[index]
           if (!isObject(layer)) continue
           total += 1
-          if (layer.type === 'frame') countList(childrenOf(layer))
+          if (isContainerLayer(layer)) countList(childrenOf(layer))
         }
       }
       const artboards = artboardsOf(doc)
@@ -149,7 +176,7 @@
         if (!isObject(layer)) return layer
         let result = mapper(layer)
         if (!isObject(result)) result = layer
-        if (result.type === 'frame') {
+        if (isContainerLayer(result)) {
           const kids = childrenOf(result)
           const nextKids = mapLayerList(kids, mapper)
           if (nextKids !== kids) result = Object.assign({}, result, { children: nextKids })
@@ -168,7 +195,7 @@
           changed = true
           return Object.assign({}, layer, { children: nextChildren })
         }
-        if (layer.type === 'frame') {
+        if (isContainerLayer(layer)) {
           const kids = childrenOf(layer)
           const nextKids = replaceLayerListIn(kids, parentId, nextChildren)
           if (nextKids !== kids) {
@@ -206,6 +233,41 @@
       if (!doc) return doc
       function mapper(layer) {
         if (layer.id !== layerId) return layer
+        return Object.assign({}, layer, patch)
+      }
+      let touched = false
+      const artboards = artboardsOf(doc).map(function (artboard) {
+        if (!isObject(artboard)) return artboard
+        const layers = layersOf(artboard)
+        const nextLayers = mapLayerList(layers, mapper)
+        if (nextLayers === layers) return artboard
+        touched = true
+        return Object.assign({}, artboard, { layers: nextLayers })
+      })
+      if (!touched) return doc
+      return Object.assign({}, doc, { artboards: artboards })
+    }
+
+    /**
+     * Batched variant of `docPatchLayer`: `entries` is `[{ layerId, patch }]`. Returns one new
+     * document for every changed layer so a gesture over N selected layers triggers a single
+     * state update (N=50 must stay smooth), and reuses the original arrays when nothing changed.
+     */
+    function docPatchLayers(doc, entries) {
+      if (!doc || !Array.isArray(entries) || entries.length === 0) return doc
+      const patches = new Map()
+      for (let index = 0; index < entries.length; index += 1) {
+        const entry = entries[index]
+        if (!isObject(entry)) continue
+        if (typeof entry.layerId !== 'string' || !entry.layerId) continue
+        if (!isObject(entry.patch)) continue
+        if (patches.has(entry.layerId)) continue
+        patches.set(entry.layerId, entry.patch)
+      }
+      if (patches.size === 0) return doc
+      function mapper(layer) {
+        const patch = patches.get(layer.id)
+        if (!patch) return layer
         return Object.assign({}, layer, patch)
       }
       let touched = false
@@ -269,6 +331,36 @@
       return docReplaceLayerList(doc, artboardId, null, list)
     }
 
+    /** Batched variant: insert several layers (in order) into one destination. */
+    function docInsertLayers(doc, destination, layers, index) {
+      if (!doc || !isObject(destination) || !Array.isArray(layers) || layers.length === 0) return doc
+      const parentId =
+        typeof destination.parentId === 'string' && destination.parentId
+          ? destination.parentId
+          : null
+      const artboardId =
+        typeof destination.artboardId === 'string' && destination.artboardId
+          ? destination.artboardId
+          : null
+      if (!parentId && !artboardId) return doc
+      let baseList = null
+      let ownerArtboardId = artboardId
+      if (parentId) {
+        const parentFound = findLayerById(doc, parentId)
+        if (!parentFound) return doc
+        baseList = childrenOf(parentFound.layer)
+        ownerArtboardId = parentFound.artboard.id
+      } else {
+        const artboard = findArtboardById(doc, artboardId)
+        if (!artboard) return doc
+        baseList = layersOf(artboard)
+      }
+      const list = (baseList || []).slice()
+      const position = typeof index === 'number' ? clamp(index, 0, list.length) : list.length
+      list.splice.apply(list, [position, 0].concat(layers))
+      return docReplaceLayerList(doc, ownerArtboardId, parentId, list)
+    }
+
     /** Remove one layer (not its comments) from wherever it lives. */
     function removeLayerFromTree(doc, layerId) {
       if (!doc) return doc
@@ -289,6 +381,80 @@
       const next = removeLayerFromTree(doc, layerId)
       return Object.assign({}, next, {
         comments: commentsOf(next).filter(function (comment) {
+          return (
+            !isObject(comment) ||
+            typeof comment.layerId !== 'string' ||
+            !removedIds.has(comment.layerId)
+          )
+        }),
+      })
+    }
+
+    /**
+     * Batched variant of `docRemoveLayer`: removes several layer roots and every comment that
+     * referenced anything in their subtrees, in ONE document copy. Ids nested inside another
+     * removed id are dropped from the work list (the ancestor carries the subtree).
+     */
+    function docRemoveLayers(doc, layerIds) {
+      if (!doc) return doc
+      const requested = []
+      const requestedSet = new Set()
+      const raw = Array.isArray(layerIds) ? layerIds : []
+      for (let index = 0; index < raw.length; index += 1) {
+        const layerId = raw[index]
+        if (typeof layerId !== 'string' || !layerId) continue
+        if (requestedSet.has(layerId)) continue
+        requestedSet.add(layerId)
+        requested.push(layerId)
+      }
+      if (requested.length === 0) return doc
+      // Keep only outermost targets: an id whose ancestor is also removed is already covered.
+      const roots = requested.filter(function (layerId) {
+        let found = findLayerById(doc, layerId)
+        while (found && found.parent) {
+          if (requestedSet.has(found.parent.id)) return false
+          found = findLayerById(doc, found.parent.id)
+        }
+        return true
+      })
+      if (roots.length === 0) return doc
+      const targetIds = new Set(roots)
+      const removedIds = new Set()
+
+      function pruneList(list) {
+        const layers = Array.isArray(list) ? list : []
+        let changed = false
+        const next = layers.map(function (layer) {
+          if (!isObject(layer)) return layer
+          if (targetIds.has(layer.id)) {
+            collectLayerIds(layer, removedIds)
+            changed = true
+            return null
+          }
+          if (!isContainerLayer(layer)) return layer
+          const kids = childrenOf(layer)
+          const nextKids = pruneList(kids)
+          if (nextKids === kids) return layer
+          changed = true
+          return Object.assign({}, layer, { children: nextKids })
+        })
+        if (!changed) return layers
+        return next.filter(function (layer) { return layer !== null })
+      }
+
+      let touched = false
+      const artboards = artboardsOf(doc).map(function (artboard) {
+        if (!isObject(artboard)) return artboard
+        const layers = layersOf(artboard)
+        const nextLayers = pruneList(layers)
+        if (nextLayers === layers) return artboard
+        touched = true
+        return Object.assign({}, artboard, { layers: nextLayers })
+      })
+      if (!touched) return doc
+      return Object.assign({}, doc, {
+        artboards: artboards,
+        comments: commentsOf(doc).filter(function (comment) {
           return (
             !isObject(comment) ||
             typeof comment.layerId !== 'string' ||

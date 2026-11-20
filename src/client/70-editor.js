@@ -1,3 +1,48 @@
+    /* ------------------------------------------------------------------------------------------
+     * Interaction tuning + feature copy
+     *
+     * New feature copy lives here as a local constant (see CONTRACT §8.9) and is folded into the
+     * strings table during the localization pass.
+     * ---------------------------------------------------------------------------------------- */
+
+    /** Snap distance in SCREEN pixels (divided by the camera zoom before comparing). */
+    const SNAP_THRESHOLD_SCREEN = 6
+    const TIDY_GAP = 16
+    const PASTE_OFFSET = 16
+    const DUPLICATE_OFFSET = 12
+    const DOUBLE_CLICK_MS = 350
+    const CLIPBOARD_KIND = 'dsh-design-canvas/layers'
+    /** Host cap on ops per call (host/model.js MAX_OPS_PER_CALL). */
+    const MAX_OPS_PER_BATCH = 200
+
+    const INTERACTION_COPY = {
+      locked: 'Locked — unlock it in the inspector to edit',
+      groupNeedsTwo: 'Select at least two layers to group them',
+      groupSameParent: 'Grouping needs layers that share the same parent',
+      groupAutoLayout: 'Cannot group inside an auto-layout frame — turn its layout off first',
+      ungroupNeedsGroup: 'Select a group to ungroup it',
+      alignNeedsTwo: 'Select at least two layers to align them',
+      alignSameParent: 'Aligning needs layers that share the same parent',
+      distributeNeedsThree: 'Select at least three layers to distribute them',
+      pasteEmpty: 'Nothing to paste — copy layers first',
+      pasteLimit: 'This selection is too large to paste in one step',
+      clipboardDenied: '',
+    }
+
+    /** Alignment kinds -> the axis and the edge/center they snap to on that axis. */
+    const ALIGN_SPECS = {
+      left: { axis: 'x', pos: 'start' },
+      'center-h': { axis: 'x', pos: 'center' },
+      hcenter: { axis: 'x', pos: 'center' },
+      'center-x': { axis: 'x', pos: 'center' },
+      right: { axis: 'x', pos: 'end' },
+      top: { axis: 'y', pos: 'start' },
+      'center-v': { axis: 'y', pos: 'center' },
+      vcenter: { axis: 'y', pos: 'center' },
+      'center-y': { axis: 'y', pos: 'center' },
+      bottom: { axis: 'y', pos: 'end' },
+    }
+
     /**
      * Canvas editor state machine: document sync with the Host, selection, camera, history,
      * gestures, mutations and comment flow. `CanvasRoot` (74-shell.js) renders it.
@@ -17,8 +62,18 @@
       const [loadError, setLoadError] = React.useState('')
       const [status, setStatus] = React.useState('synced')
       const [inlineError, setInlineError] = React.useState('')
-      const [selectedLayerId, setSelectedLayerId] = React.useState(null)
+      // Multi-selection: ordered ids, the LAST one is the primary layer (`selectedLayerId`). The
+      // array is the source of truth; `selectedLayerId` stays for single-layer affordances.
+      const [selectedLayerIds, setSelectedLayerIds] = React.useState([])
       const [selectedArtboardId, setSelectedArtboardId] = React.useState(null)
+      // Id of the group the user drilled into (double-click / Enter/ Esc steps back out).
+      const [drillGroupId, setDrillGroupId] = React.useState(null)
+      // Marquee rect in artboard-local canvas units, or null while not dragging.
+      const [marquee, setMarquee] = React.useState(null)
+      // Active snap guide lines for the renderer: [{ axis: 'x'|'y', at: number }].
+      const [snapGuides, setSnapGuides] = React.useState([])
+      const [snapGuidesArtboardId, setSnapGuidesArtboardId] = React.useState(null)
+      const [snapEnabled, setSnapEnabled] = React.useState(true)
       const [camera, setCamera] = React.useState(defaultCamera)
       const [panning, setPanning] = React.useState(false)
       const [spaceHeld, setSpaceHeld] = React.useState(false)
@@ -31,6 +86,10 @@
       const [treeOpen, setTreeOpen] = React.useState(true)
       const [inspectorOpen, setInspectorOpen] = React.useState(true)
 
+      const selectedLayerId = selectedLayerIds.length
+        ? selectedLayerIds[selectedLayerIds.length - 1]
+        : null
+
       const docRef = React.useRef(null)
       const versionRef = React.useRef(0)
       const cameraRef = React.useRef(defaultCamera())
@@ -38,8 +97,15 @@
       const spaceHeldRef = React.useRef(false)
       const imageInputRef = React.useRef(null)
       const imagePickSourceRef = React.useRef('toolbar')
+      const selectedLayerIdsRef = React.useRef([])
       const selectedLayerIdRef = React.useRef(null)
       const selectedArtboardIdRef = React.useRef(null)
+      const drillGroupIdRef = React.useRef(null)
+      const snapEnabledRef = React.useRef(true)
+      const marqueeRef = React.useRef(null)
+      const clipboardRef = React.useRef(null)
+      const gestureFrameRef = React.useRef(null)
+      const lastLayerPointerRef = React.useRef(null)
       const gestureRef = React.useRef(null)
       const treeRef = React.useRef(null)
       const inFlightRef = React.useRef(0)
@@ -57,11 +123,20 @@
 
       React.useEffect(
         function () {
+          selectedLayerIdsRef.current = selectedLayerIds
           selectedLayerIdRef.current = selectedLayerId
           selectedArtboardIdRef.current = selectedArtboardId
+          drillGroupIdRef.current = drillGroupId
+          snapEnabledRef.current = snapEnabled
         },
-        [selectedLayerId, selectedArtboardId],
+        [selectedLayerIds, selectedLayerId, selectedArtboardId, drillGroupId, snapEnabled],
       )
+
+      /** Backwards-compatible single-selection setter (shell/inspector still know this name). */
+      function setSelectedLayerId(layerId) {
+        setSelectedLayerIds(layerId ? [layerId] : [])
+        if (!layerId) setDrillGroupId(null)
+      }
 
       /* ------------------------------- local doc application ------------------------------- */
 
@@ -104,6 +179,13 @@
           setStatus('synced')
           setSelectedLayerId(null)
           setSelectedArtboardId(null)
+          setDrillGroupId(null)
+          setMarquee(null)
+          setSnapGuides([])
+          setSnapGuidesArtboardId(null)
+          marqueeRef.current = null
+          clipboardRef.current = null
+          lastLayerPointerRef.current = null
           setComposer(null)
           setCommentError('')
           setTreeOpen(true)
@@ -161,8 +243,10 @@
           function poll() {
             if (cancelled) return
             if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return
-            if (gestureRef.current) return
+            if (gestureRef.current || marqueeRef.current) return
             if (inFlightRef.current > 0) return
+            // A batched nudge holds a local-only preview; never let a poll clobber it.
+            if (nudgeRef.current) return
             getState(sessionId)
               .then(function (data) {
                 if (cancelled) return
@@ -172,11 +256,30 @@
                 if (!data || !data.doc) return
                 if (data.path) setBoardPath(String(data.path))
                 const remoteVersion = typeof data.version === 'number' ? data.version : 0
-                if (remoteVersion <= versionRef.current) return
-                const external = remoteVersion !== lastLocalVersionRef.current
+                const heldVersion = versionRef.current
+                const sameVersion = remoteVersion === heldVersion
+                // The Host owns the board: a replaced/reset document can arrive with an equal or
+                // LOWER version (Reset doc, adopting another workspace's board). Adopt it when the
+                // version moved in either direction or when the board identity differs, so the
+                // canvas never keeps showing a document the Host no longer holds.
+                const replacedInPlace = sameVersion && !sameDocumentIdentity(docRef.current, data.doc)
+                if (sameVersion && !replacedInPlace) return
+                const regressed = remoteVersion < heldVersion
+                const external = remoteVersion !== lastLocalVersionRef.current || replacedInPlace
+                lastLocalVersionRef.current = remoteVersion
                 applyDoc(data.doc, remoteVersion)
-                beacon('state-loaded', { version: remoteVersion, external: external })
-                if (external) {
+                if (regressed) {
+                  beacon('state-version-regressed', {
+                    from: heldVersion,
+                    to: remoteVersion,
+                    path: String(data.path || '').slice(0, 80),
+                  })
+                } else if (replacedInPlace) {
+                  beacon('state-replaced-in-place', { version: remoteVersion })
+                } else {
+                  beacon('state-loaded', { version: remoteVersion, external: external })
+                }
+                if (external || regressed || replacedInPlace) {
                   setStatus('revising')
                   if (statusTimerRef.current) clearTimeout(statusTimerRef.current)
                   statusTimerRef.current = setTimeout(function () {
@@ -392,11 +495,18 @@
       React.useEffect(
         function () {
           if (!doc) return
-          if (selectedLayerId && !findLayerById(doc, selectedLayerId)) setSelectedLayerId(null)
+          const stillThere = selectedLayerIds.filter(function (layerId) {
+            return !!findLayerById(doc, layerId)
+          })
+          if (stillThere.length !== selectedLayerIds.length) setSelectedLayerIds(stillThere)
           if (selectedArtboardId && !findArtboardById(doc, selectedArtboardId)) setSelectedArtboardId(null)
+          if (drillGroupId) {
+            const drilled = findLayerById(doc, drillGroupId)
+            if (!drilled || drilled.layer.type !== 'group') setDrillGroupId(null)
+          }
           if (composer && !findLayerById(doc, composer.layerId)) setComposer(null)
         },
-        [doc, selectedLayerId, selectedArtboardId, composer],
+        [doc, selectedLayerIds, selectedArtboardId, drillGroupId, composer],
       )
 
       /* ------------------------------- ops bridge ------------------------------- */
@@ -529,13 +639,36 @@
         Object.keys(patch).forEach(function (key) {
           const previous = layer[key]
           if (previous === undefined) {
-            // Absent props: only nullable/boolean defaults can be restored exactly.
+            // Absent props: restore the documented "absent" state. Boolean flags and size
+            // bounds clear with false/null (CONTRACT: locked/hug/min-max are absent by default),
+            // nullable props clear with null, enums get their documented default back.
             if (key === 'shadow' || key === 'layout' || key === 'alignSelf') inverse[key] = null
             else if (key === 'visible') inverse[key] = true
             else if (key === 'grow' || key === 'clip') inverse[key] = false
-            else if (key === 'opacity') inverse[key] = 1
+            else if (
+              key === 'locked' ||
+              key === 'hugWidth' ||
+              key === 'hugHeight' ||
+              key === 'dashed' ||
+              key === 'arrowStart' ||
+              key === 'arrowEnd'
+            ) {
+              inverse[key] = false
+            } else if (
+              key === 'minWidth' ||
+              key === 'minHeight' ||
+              key === 'maxWidth' ||
+              key === 'maxHeight' ||
+              key === 'rowGap' ||
+              key === 'columnGap'
+            ) {
+              inverse[key] = null
+            } else if (key === 'opacity') inverse[key] = 1
             else if (key === 'letterSpacing') inverse[key] = 0
             else if (key === 'textTransform') inverse[key] = 'none'
+            else if (key === 'justify') inverse[key] = 'start'
+            else if (key === 'align') inverse[key] = 'stretch'
+            else if (key === 'alignContent') inverse[key] = 'stretch'
             return
           }
           inverse[key] = previous
@@ -655,26 +788,344 @@
         }
       }
 
-      /* ------------------------------- mutations ------------------------------- */
+      /* ------------------------------- selection ------------------------------- */
 
-      function selectLayer(layerId, artboardId) {
-        setSelectedLayerId(layerId)
+      /** Computed node for a layer id (with artboard-local worldRect), or null. */
+      function nodeForLayer(layerId) {
+        const tree = treeRef.current
+        if (!tree || !tree.byId || typeof layerId !== 'string' || !layerId) return null
+        return tree.byId.get(layerId) || null
+      }
+
+      /**
+       * Figma-like click target: a click on a child of a `group` selects the group first; once the
+       * user drilled into that group (double-click / Enter) the child itself is the target.
+       * Frames never trap clicks — their children stay directly selectable (v1 behaviour).
+       */
+      function selectionTargetForNode(node, drillId) {
+        if (!node) return null
+        const chain = []
+        let current = node
+        while (current) {
+          chain.push(current)
+          current = current.parent || null
+        }
+        let stop = chain.length - 1
+        if (drillId) {
+          for (let index = 0; index < chain.length; index += 1) {
+            if (chain[index] && chain[index].id === drillId) {
+              stop = index - 1
+              break
+            }
+          }
+        }
+        for (let index = stop; index >= 0; index -= 1) {
+          if (chain[index] && chain[index].type === 'group') return chain[index]
+        }
+        return node
+      }
+
+      function artboardIdForNode(node) {
+        return node && node.artboard && typeof node.artboard.id === 'string' ? node.artboard.id : null
+      }
+
+      function artboardIdForLayer(layerId) {
+        const node = nodeForLayer(layerId)
+        if (node) return artboardIdForNode(node)
+        const current = docRef.current
+        const found = current && layerId ? findLayerById(current, layerId) : null
+        return found ? found.artboard.id : null
+      }
+
+      /** Sibling nodes of a computed node (front-to-back array as authored). */
+      function siblingNodesOf(node) {
+        if (!node) return []
+        if (node.parent) return Array.isArray(node.parent.children) ? node.parent.children : []
+        const tree = treeRef.current
+        if (!tree || !Array.isArray(tree.artboards)) return []
+        for (let index = 0; index < tree.artboards.length; index += 1) {
+          const entry = tree.artboards[index]
+          if (entry && entry.artboard && node.artboard && entry.artboard.id === node.artboard.id) {
+            return Array.isArray(entry.layers) ? entry.layers : []
+          }
+        }
+        return []
+      }
+
+      /** Ids from `fromId` to `toId` (inclusive) when both are siblings, else null. */
+      function siblingRangeIds(fromId, toId) {
+        const fromNode = nodeForLayer(fromId)
+        const toNode = nodeForLayer(toId)
+        if (!fromNode || !toNode) return null
+        if ((fromNode.parent ? fromNode.parent.id : null) !== (toNode.parent ? toNode.parent.id : null)) {
+          return null
+        }
+        if (artboardIdForNode(fromNode) !== artboardIdForNode(toNode)) return null
+        const siblings = siblingNodesOf(fromNode)
+        let fromIndex = -1
+        let toIndex = -1
+        for (let index = 0; index < siblings.length; index += 1) {
+          const sibling = siblings[index]
+          if (!sibling) continue
+          if (sibling.id === fromId) fromIndex = index
+          if (sibling.id === toId) toIndex = index
+        }
+        if (fromIndex < 0 || toIndex < 0) return null
+        const start = Math.min(fromIndex, toIndex)
+        const end = Math.max(fromIndex, toIndex)
+        const ids = []
+        for (let index = start; index <= end; index += 1) {
+          if (siblings[index] && siblings[index].id) ids.push(siblings[index].id)
+        }
+        return ids
+      }
+
+      /**
+       * Outermost selected ids: when both a container and one of its descendants are selected, the
+       * container is the unit every mutation works on (a group cannot be moved twice).
+       */
+      function rootSelectionIds(ids) {
+        const current = docRef.current
+        const list = Array.isArray(ids) ? ids : []
+        const roots = []
+        if (!current) return list.slice()
+        const selected = new Set(list)
+        for (let index = 0; index < list.length; index += 1) {
+          const layerId = list[index]
+          if (typeof layerId !== 'string' || !layerId) continue
+          if (roots.indexOf(layerId) >= 0) continue
+          let found = findLayerById(current, layerId)
+          let nested = false
+          const guard = new Set()
+          while (found && found.parent) {
+            if (guard.has(found.parent.id)) break
+            guard.add(found.parent.id)
+            if (selected.has(found.parent.id)) {
+              nested = true
+              break
+            }
+            found = findLayerById(current, found.parent.id)
+          }
+          if (!nested) roots.push(layerId)
+        }
+        return roots
+      }
+
+      function selectionNodes(ids) {
+        const list = Array.isArray(ids) ? ids : []
+        const nodes = []
+        for (let index = 0; index < list.length; index += 1) {
+          const node = nodeForLayer(list[index])
+          if (node) nodes.push(node)
+        }
+        return nodes
+      }
+
+      /** Union box of a selection in artboard-local canvas units, or null. */
+      function selectionBounds(ids) {
+        const nodes = selectionNodes(ids)
+        return unionRects(
+          nodes.map(function (node) { return node.worldRect }),
+        )
+      }
+
+      /**
+       * Single funnel for every selection change: ordered ids, the owning artboard, the drilled
+       * group and the composer. Refs are written synchronously so the pointer handler that just
+       * changed the selection can start a gesture in the same tick.
+       */
+      function applySelection(ids, artboardId, drillId) {
+        const next = []
+        const seen = new Set()
+        const raw = Array.isArray(ids) ? ids : []
+        for (let index = 0; index < raw.length; index += 1) {
+          const layerId = raw[index]
+          if (typeof layerId !== 'string' || !layerId || seen.has(layerId)) continue
+          seen.add(layerId)
+          next.push(layerId)
+        }
+        const drill = typeof drillId === 'string' && drillId ? drillId : null
+        const primary = next.length ? next[next.length - 1] : null
+        selectedLayerIdsRef.current = next
+        selectedLayerIdRef.current = primary
+        if (artboardId) selectedArtboardIdRef.current = artboardId
+        drillGroupIdRef.current = drill
+        setSelectedLayerIds(next)
+        setDrillGroupId(drill)
         if (artboardId) setSelectedArtboardId(artboardId)
         setComposer(function (previous) {
-          return previous && previous.layerId !== layerId ? null : previous
+          if (!previous) return previous
+          return primary && previous.layerId === primary ? previous : null
         })
       }
 
+      /**
+       * Select one layer. `options = { additive, range }`: additive (Shift / Ctrl / Cmd+click)
+       * toggles the layer in the set; range extends from the primary to the target sibling.
+       * Clicking inside a group selects the group unless the user drilled into it.
+       */
+      function selectLayer(layerId, artboardId, options) {
+        const opts = isObject(options) ? options : {}
+        if (!layerId) {
+          clearSelection()
+          return
+        }
+        const node = nodeForLayer(layerId)
+        const drill = drillGroupIdRef.current
+        const target = node ? selectionTargetForNode(node, drill) : null
+        const targetId = target ? target.id : layerId
+        const board =
+          artboardId || artboardIdForNode(target) || artboardIdForLayer(layerId) || selectedArtboardIdRef.current || null
+        const currentIds = selectedLayerIdsRef.current
+        if (opts.additive === true || opts.toggle === true) {
+          const at = currentIds.indexOf(targetId)
+          const nextIds =
+            at >= 0
+              ? currentIds.filter(function (id) { return id !== targetId })
+              : currentIds.concat([targetId])
+          applySelection(nextIds, board, drill)
+          beacon('select-layer', { count: nextIds.length, additive: true })
+          return
+        }
+        if (opts.range === true && currentIds.length) {
+          const range = siblingRangeIds(currentIds[currentIds.length - 1], targetId)
+          if (range && range.length) {
+            applySelection(range, board, drill)
+            beacon('select-layer', { count: range.length, range: true })
+            return
+          }
+        }
+        applySelection([targetId], board, drill)
+      }
+
+      /** Replace the selection with a set of ids (tree multi-select, marquee, paste, …). */
+      function selectLayers(ids, artboardId) {
+        const current = docRef.current
+        const clean = []
+        const seen = new Set()
+        const raw = Array.isArray(ids) ? ids : []
+        for (let index = 0; index < raw.length; index += 1) {
+          const layerId = raw[index]
+          if (typeof layerId !== 'string' || !layerId || seen.has(layerId)) continue
+          if (current && !findLayerById(current, layerId)) continue
+          seen.add(layerId)
+          clean.push(layerId)
+        }
+        const primary = clean.length ? clean[clean.length - 1] : null
+        applySelection(
+          clean,
+          artboardId || (primary ? artboardIdForLayer(primary) : null),
+          null,
+        )
+        return clean
+      }
+
+      /** Select every top-level layer of the selected (or first) artboard — Ctrl/Cmd+A. */
+      function selectAllInArtboard() {
+        const current = docRef.current
+        if (!current) return []
+        const boards = artboardsOf(current)
+        let boardId = selectedArtboardIdRef.current
+        if (!boardId && selectedLayerIdRef.current) boardId = artboardIdForLayer(selectedLayerIdRef.current)
+        if (!boardId) {
+          const first = boards.find(function (artboard) { return isObject(artboard) })
+          boardId = first ? first.id : null
+        }
+        const artboard = boardId ? findArtboardById(current, boardId) : null
+        if (!artboard) {
+          clearSelection()
+          return []
+        }
+        const ids = layersOf(artboard)
+          .filter(function (layer) { return isObject(layer) && typeof layer.id === 'string' })
+          .map(function (layer) { return layer.id })
+        applySelection(ids, artboard.id, null)
+        beacon('select-all', { count: ids.length })
+        return ids
+      }
+
       function selectArtboard(artboardId) {
-        setSelectedArtboardId(artboardId)
-        setSelectedLayerId(null)
-        setComposer(null)
+        applySelection([], artboardId || null, null)
       }
 
       function clearSelection() {
-        setSelectedLayerId(null)
-        setComposer(null)
+        applySelection([], null, null)
       }
+
+      /** Enter: step INTO the selected container, selecting its front-most child. */
+      function drillIntoSelection() {
+        const primaryId = selectedLayerIdRef.current
+        if (!primaryId) return false
+        const node = nodeForLayer(primaryId)
+        if (!node || !isContainerLayer(node.layer)) return false
+        const kids = Array.isArray(node.children) ? node.children : []
+        const child = kids.length ? kids[kids.length - 1] : null
+        applySelection(
+          child ? [child.id] : [],
+          artboardIdForNode(node),
+          node.type === 'group' ? node.id : drillGroupIdRef.current,
+        )
+        beacon('drill-in', { layerId: node.id, type: node.type })
+        return true
+      }
+
+      /** Double-click: drill into the nearest containing group (or into a container) and pick it. */
+      function drillIntoNode(node) {
+        if (!node) return false
+        let group = null
+        let current = node.parent || null
+        while (current) {
+          if (current.type === 'group') {
+            group = current
+            break
+          }
+          current = current.parent || null
+        }
+        if (group) {
+          applySelection([node.id], artboardIdForNode(node), group.id)
+          beacon('drill-in', { layerId: group.id, type: 'group' })
+          return true
+        }
+        if (isContainerLayer(node.layer)) {
+          const kids = Array.isArray(node.children) ? node.children : []
+          const child = kids.length ? kids[kids.length - 1] : null
+          applySelection(
+            child ? [child.id] : [node.id],
+            artboardIdForNode(node),
+            node.type === 'group' ? node.id : drillGroupIdRef.current,
+          )
+          beacon('drill-in', { layerId: node.id, type: node.type })
+          return true
+        }
+        applySelection([node.id], artboardIdForNode(node), drillGroupIdRef.current)
+        return true
+      }
+
+      /** Esc: step out of the drilled group to the group itself, else clear the selection. */
+      function stepSelectionOut() {
+        const drillId = drillGroupIdRef.current
+        if (drillId) {
+          const node = nodeForLayer(drillId)
+          applySelection([drillId], node ? artboardIdForNode(node) : null, null)
+          return true
+        }
+        if (selectedLayerIdsRef.current.length) {
+          clearSelection()
+          return true
+        }
+        return false
+      }
+
+      /** Toggle snapping on/off (Alt temporarily disables it for one drag regardless). */
+      function toggleSnap() {
+        const next = !snapEnabledRef.current
+        snapEnabledRef.current = next
+        setSnapEnabled(next)
+        beacon('snap-toggle', { enabled: next })
+        return next
+      }
+
+      /* ------------------------------- mutations ------------------------------- */
 
       function openComposerFor(layerId, artboardId) {
         const current = docRef.current
@@ -687,29 +1138,47 @@
         setComposer({ layerId: layerId, artboardId: targetArtboard, text: '' })
       }
 
-      function commitLayer(patch) {
-        const layerId = selectedLayerIdRef.current
-        if (!layerId) return
-        const current = docRef.current
-        const found = current ? findLayerById(current, layerId) : null
-        if (!found) return
+      /** Changed subset of `patch` for one layer (null when nothing actually changes). */
+      function patchDiff(layer, patch) {
+        if (!isObject(patch)) return null
         const changed = {}
         let count = 0
         Object.keys(patch).forEach(function (key) {
-          if (found.layer[key] !== patch[key]) {
+          if (!isObject(layer) || layer[key] !== patch[key]) {
             changed[key] = patch[key]
             count += 1
           }
         })
-        if (count === 0) return
-        patchLocalLayer(layerId, changed)
-        const ops = [{ type: 'layer.update', layerId: layerId, patch: changed }]
-        const inversePatch = inversePatchFor(found.layer, changed)
-        const inverse =
-          Object.keys(inversePatch).length > 0
-            ? [{ type: 'layer.update', layerId: layerId, patch: inversePatch }]
-            : []
+        return count > 0 ? changed : null
+      }
+
+      /**
+       * Apply a property patch to EVERY selected layer as one op batch and one undo entry.
+       * Single-layer edits (inspector, tree) keep working unchanged; multi-edit comes for free.
+       */
+      function commitLayer(patch) {
+        const ids = selectedLayerIdsRef.current
+        const current = docRef.current
+        if (!current || !ids.length || !isObject(patch)) return false
+        const entries = []
+        const ops = []
+        const inverse = []
+        for (let index = 0; index < ids.length; index += 1) {
+          const found = findLayerById(current, ids[index])
+          if (!found) continue
+          const changed = patchDiff(found.layer, patch)
+          if (!changed) continue
+          entries.push({ layerId: found.layer.id, patch: changed })
+          ops.push({ type: 'layer.update', layerId: found.layer.id, patch: changed })
+          const inversePatch = inversePatchFor(found.layer, changed)
+          if (Object.keys(inversePatch).length > 0) {
+            inverse.push({ type: 'layer.update', layerId: found.layer.id, patch: inversePatch })
+          }
+        }
+        if (ops.length === 0) return false
+        applyDocLocal(docPatchLayers(current, entries))
         commitWithHistory('update', ops, inverse)
+        return true
       }
 
       function commitArtboard(patch) {
@@ -737,6 +1206,78 @@
         commitWithHistory('artboard', ops, inverse)
       }
 
+      /* ------------------------------- id-based mutations (tree / inspector) ------------------------------- */
+
+      /**
+       * Patch ONE layer by id, independent of the current selection, as a single undo entry.
+       * The tree and the inspector call this for inline rename, drag-reorder and per-row edits.
+       */
+      function updateLayer(layerId, patch) {
+        const current = docRef.current
+        if (!current || typeof layerId !== 'string' || !layerId || !isObject(patch)) return false
+        const found = findLayerById(current, layerId)
+        if (!found) return false
+        const changed = patchDiff(found.layer, patch)
+        if (!changed) return false
+        applyDocLocal(docPatchLayers(current, [{ layerId: layerId, patch: changed }]))
+        const inversePatch = inversePatchFor(found.layer, changed)
+        commitWithHistory(
+          'update',
+          [{ type: 'layer.update', layerId: layerId, patch: changed }],
+          Object.keys(inversePatch).length > 0
+            ? [{ type: 'layer.update', layerId: layerId, patch: inversePatch }]
+            : [],
+        )
+        return true
+      }
+
+      /** Inline rename of one layer (trimmed, empty names are ignored). */
+      function renameLayer(layerId, name) {
+        const trimmed = typeof name === 'string' ? name.trim().slice(0, 200) : ''
+        if (!trimmed) return false
+        return updateLayer(layerId, { name: trimmed })
+      }
+
+      /** Inline rename of an artboard (single artboard.update + one undo entry). */
+      function renameArtboard(artboardId, name) {
+        const current = docRef.current
+        if (!current || typeof artboardId !== 'string' || !artboardId) return false
+        const trimmed = typeof name === 'string' ? name.trim().slice(0, 200) : ''
+        if (!trimmed) return false
+        const artboard = findArtboardById(current, artboardId)
+        if (!artboard || artboard.name === trimmed) return false
+        const previousName =
+          typeof artboard.name === 'string' && artboard.name ? artboard.name : 'Artboard'
+        applyDocLocal(docPatchArtboard(current, artboardId, { name: trimmed }))
+        commitWithHistory(
+          'rename-artboard',
+          [{ type: 'artboard.update', artboardId: artboardId, patch: { name: trimmed } }],
+          [{ type: 'artboard.update', artboardId: artboardId, patch: { name: previousName } }],
+        )
+        beacon('artboard-rename', { artboardId: artboardId })
+        return true
+      }
+
+      /** Reorder one layer within its current parent (tree drag/drop), single undo entry. */
+      function reorderLayer(layerId, index) {
+        const current = docRef.current
+        if (!current || typeof layerId !== 'string' || !layerId) return false
+        const found = findLayerById(current, layerId)
+        if (!found) return false
+        const siblings = found.parent ? childrenOf(found.parent) : layersOf(found.artboard)
+        if (siblings.length < 2) return false
+        const target = clamp(Math.round(finiteNumber(index, found.index)), 0, siblings.length - 1)
+        if (target === found.index) return false
+        applyDocLocal(docReorderLayer(current, layerId, target))
+        commitWithHistory(
+          'reorder',
+          [{ type: 'layer.reorder', layerId: layerId, index: target }],
+          [{ type: 'layer.reorder', layerId: layerId, index: found.index }],
+        )
+        beacon('layer-reorder', { layerId: layerId, index: target, source: 'tree' })
+        return true
+      }
+
       function toggleVisible(layerId) {
         const current = docRef.current
         const found = current ? findLayerById(current, layerId) : null
@@ -756,49 +1297,199 @@
         )
       }
 
-      function deleteLayerById(layerId) {
+      /**
+       * Delete every given layer (roots only) in ONE document update + one undo entry.
+       * Locked layers are protected from direct manipulation; the rest of the selection still goes.
+       */
+      function deleteLayersByIds(ids) {
         const current = docRef.current
-        const found = current ? findLayerById(current, layerId) : null
-        if (!current || !found) return
-        const insertOps = insertOpsForSubtree(
-          found.layer,
-          found.parentId ? { parentId: found.parentId } : { artboardId: found.artboard.id },
-          found.index,
-        )
-        applyDocLocal(docRemoveLayer(current, layerId))
-        if (selectedLayerIdRef.current === layerId) setSelectedLayerId(null)
-        setComposer(function (previous) {
-          return previous && previous.layerId === layerId ? null : previous
+        if (!current) return false
+        const roots = rootSelectionIds(ids)
+        if (!roots.length) return false
+        const buckets = []
+        const removed = []
+        let blockedLocked = false
+        for (let index = 0; index < roots.length; index += 1) {
+          const found = findLayerById(current, roots[index])
+          if (!found) continue
+          if (found.layer.locked === true) {
+            blockedLocked = true
+            continue
+          }
+          buckets.push({
+            key: (found.parentId ? 'p:' + found.parentId : 'a:' + found.artboard.id) + '#' + found.index,
+            parentId: found.parentId,
+            artboardId: found.artboard.id,
+            index: found.index,
+            ops: insertOpsForSubtree(
+              found.layer,
+              found.parentId ? { parentId: found.parentId } : { artboardId: found.artboard.id },
+              found.index,
+            ),
+          })
+          removed.push(found.layer.id)
+        }
+        if (removed.length === 0) {
+          if (blockedLocked) setInlineError(INTERACTION_COPY.locked)
+          return false
+        }
+        applyDocLocal(docRemoveLayers(current, removed))
+        const nextDoc = docRef.current
+        const remaining = selectedLayerIdsRef.current.filter(function (layerId) {
+          return removed.indexOf(layerId) < 0 && !!findLayerById(nextDoc, layerId)
         })
-        commitWithHistory('delete', [{ type: 'layer.delete', layerId: layerId }], insertOps)
+        applySelection(remaining, selectedArtboardIdRef.current, null)
+        // Restore in ascending sibling order so the original indexes line up again.
+        buckets.sort(function (first, second) {
+          if (first.parentId !== second.parentId) return first.parentId ? -1 : 1
+          return first.index - second.index
+        })
+        const inverse = []
+        for (let index = 0; index < buckets.length; index += 1) {
+          inverse.push.apply(inverse, buckets[index].ops)
+        }
+        commitWithHistory(
+          'delete',
+          removed.map(function (layerId) {
+            return { type: 'layer.delete', layerId: layerId }
+          }),
+          inverse,
+        )
+        if (blockedLocked) setInlineError(INTERACTION_COPY.locked)
+        beacon('layer-delete', { count: removed.length })
+        return true
+      }
+
+      function deleteLayerById(layerId) {
+        return deleteLayersByIds([layerId])
       }
 
       function deleteSelectedLayer() {
-        if (selectedLayerIdRef.current) deleteLayerById(selectedLayerIdRef.current)
+        const ids = selectedLayerIdsRef.current
+        if (!ids.length) return false
+        return deleteLayersByIds(ids)
+      }
+
+      /**
+       * Reorder ops that turn `list` into `target` (same members). Works for both the local
+       * simulation and the Host batch because `layer.reorder` is applied sequentially.
+       */
+      function reorderOpsToReach(list, target) {
+        const order = Array.isArray(list) ? list.slice() : []
+        const goal = Array.isArray(target) ? target : []
+        const ops = []
+        for (let index = 0; index < goal.length; index += 1) {
+          const wanted = goal[index]
+          if (!wanted || !wanted.id) continue
+          if (order[index] && order[index].id === wanted.id) continue
+          let from = -1
+          for (let scan = index; scan < order.length; scan += 1) {
+            if (order[scan] && order[scan].id === wanted.id) {
+              from = scan
+              break
+            }
+          }
+          if (from < 0) continue
+          const moved = order.splice(from, 1)[0]
+          order.splice(index, 0, moved)
+          ops.push({ type: 'layer.reorder', layerId: wanted.id, index: index })
+        }
+        return ops
+      }
+
+      /**
+       * Z-order moves for the whole selection: `front`, `forward`, `backward`, `back` (the tree's
+       * up/down buttons map to forward/backward). One op batch, one undo entry.
+       */
+      function reorderSelection(direction) {
+        const current = docRef.current
+        if (!current) return false
+        const mode =
+          direction === 'up' || direction === 'forward'
+            ? 'forward'
+            : direction === 'down' || direction === 'backward'
+              ? 'backward'
+              : direction === 'front' || direction === 'back'
+                ? direction
+                : null
+        if (!mode) return false
+        const roots = rootSelectionIds(selectedLayerIdsRef.current)
+        if (!roots.length) return false
+        const selectedSet = new Set(roots)
+        const groups = new Map()
+        for (let index = 0; index < roots.length; index += 1) {
+          const found = findLayerById(current, roots[index])
+          if (!found) continue
+          const key = found.parentId ? 'p:' + found.parentId : 'a:' + found.artboard.id
+          let group = groups.get(key)
+          if (!group) {
+            group = {
+              key: key,
+              list: (found.parentId ? childrenOf(found.parent) : layersOf(found.artboard)).slice(),
+            }
+            groups.set(key, group)
+          }
+        }
+        let forwardOps = []
+        let inverseOps = []
+        groups.forEach(function (group) {
+          const list = group.list
+          if (list.length < 2) return
+          const isSelected = function (layer) {
+            return !!(layer && selectedSet.has(layer.id))
+          }
+          const target = list.slice()
+          if (mode === 'front' || mode === 'back') {
+            const picked = target.filter(isSelected)
+            if (!picked.length) return
+            const rest = target.filter(function (layer) { return !isSelected(layer) })
+            const next = mode === 'front' ? rest.concat(picked) : picked.concat(rest)
+            target.length = 0
+            for (let index = 0; index < next.length; index += 1) target.push(next[index])
+          } else if (mode === 'forward') {
+            for (let index = target.length - 2; index >= 0; index -= 1) {
+              if (!isSelected(target[index]) || isSelected(target[index + 1])) continue
+              const swap = target[index]
+              target[index] = target[index + 1]
+              target[index + 1] = swap
+            }
+          } else {
+            for (let index = 1; index < target.length; index += 1) {
+              if (!isSelected(target[index]) || isSelected(target[index - 1])) continue
+              const swap = target[index]
+              target[index] = target[index - 1]
+              target[index - 1] = swap
+            }
+          }
+          forwardOps = forwardOps.concat(reorderOpsToReach(list, target))
+          inverseOps = inverseOps.concat(reorderOpsToReach(target, list))
+        })
+        if (forwardOps.length === 0) return false
+        let next = current
+        for (let index = 0; index < forwardOps.length; index += 1) {
+          next = docReorderLayer(next, forwardOps[index].layerId, forwardOps[index].index)
+        }
+        applyDocLocal(next)
+        commitWithHistory(
+          mode === 'front' || mode === 'back' ? 'arrange' : 'reorder',
+          forwardOps,
+          inverseOps,
+        )
+        beacon('layer-reorder', { source: 'selection', mode: mode, count: forwardOps.length })
+        return true
       }
 
       function moveSelected(direction) {
-        const layerId = selectedLayerIdRef.current
-        const current = docRef.current
-        if (!current || !layerId) return
-        const found = findLayerById(current, layerId)
-        if (!found) return
-        const siblings = found.parent ? childrenOf(found.parent) : layersOf(found.artboard)
-        const last = siblings.length - 1
-        const target = clamp(found.index + (direction === 'up' ? 1 : -1), 0, last)
-        if (target === found.index) return
-        applyDocLocal(docReorderLayer(current, layerId, target))
-        commitWithHistory(
-          'reorder',
-          [{ type: 'layer.reorder', layerId: layerId, index: target }],
-          [{ type: 'layer.reorder', layerId: layerId, index: found.index }],
-        )
-        beacon('layer-reorder', { layerId: layerId, index: target, source: 'buttons' })
+        return reorderSelection(direction)
+      }
+
+      function arrangeSelection(mode) {
+        return reorderSelection(mode)
       }
 
       /** layer.add must not carry `children` (the Host builds it with parentId adds). */
       function opLayerForAdd(layer) {
-        if (!isObject(layer) || layer.type !== 'frame' || !Array.isArray(layer.children)) {
+        if (!isObject(layer) || !isContainerLayer(layer) || !Array.isArray(layer.children)) {
           return layer
         }
         const copy = Object.assign({}, layer)
@@ -871,7 +1562,7 @@
           copy.x = Math.round(finiteNumber(layer.x, 0) + offsetX)
           copy.y = Math.round(finiteNumber(layer.y, 0) + offsetY)
         }
-        if (layer.type === 'frame') {
+        if (isContainerLayer(layer)) {
           copy.children = childrenOf(layer).map(function (child) {
             return cloneLayerSubtree(child, 0, 0)
           })
@@ -879,51 +1570,76 @@
         return copy
       }
 
-      /** Duplicate the selected layer/frame (subtree ids remapped) with a 12,12 offset. */
+      /**
+       * Duplicate the whole selection. Each selected root is copied with remapped subtree ids and
+       * a 12,12 offset (0 inside an auto-layout parent, where x/y are derived); everything lands in
+       * ONE `runOps` batch and ONE undo entry, and the copies become the new selection.
+       */
       function duplicateSelected() {
         try {
           const current = docRef.current
-          const layerId = selectedLayerIdRef.current
-          if (!current || !layerId) return false
-          const found = findLayerById(current, layerId)
-          if (!found) return false
-          const tree = treeRef.current
-          const node = tree && tree.byId ? tree.byId.get(layerId) || null : null
-          const autoParent = !!(node && node.autoParent)
-          // Offset in parent space only for freely positioned layers; auto-layout children
-          // derive their position from the layout anyway.
-          const offset = autoParent ? 0 : 12
-          const copy = cloneLayerSubtree(found.layer, offset, offset)
-          if (!copy) return false
-          const destination = found.parentId
-            ? { parentId: found.parentId }
-            : { artboardId: found.artboard.id }
-          if (destination.parentId) {
-            const parentFound = findLayerById(current, destination.parentId)
-            if (!parentFound || !parentFound.layer) return false
-            if (childrenOf(parentFound.layer).length >= FRAME_MAX_CHILDREN) {
-              setInlineError(strings.childLimit)
+          if (!current) return false
+          const roots = rootSelectionIds(selectedLayerIdsRef.current)
+          if (!roots.length) return false
+          const copies = []
+          const ops = []
+          let boardId = null
+          for (let index = 0; index < roots.length; index += 1) {
+            const found = findLayerById(current, roots[index])
+            if (!found) continue
+            const node = nodeForLayer(found.layer.id)
+            const autoParent = !!(node && node.autoParent)
+            const offset = autoParent ? 0 : DUPLICATE_OFFSET
+            const copy = cloneLayerSubtree(found.layer, offset, offset)
+            if (!copy) continue
+            const destination = found.parentId
+              ? { parentId: found.parentId }
+              : { artboardId: found.artboard.id }
+            if (destination.parentId) {
+              const parentFound = findLayerById(current, destination.parentId)
+              if (!parentFound || !parentFound.layer) continue
+              if (childrenOf(parentFound.layer).length + copies.length >= FRAME_MAX_CHILDREN) {
+                setInlineError(strings.childLimit)
+                continue
+              }
+              if (parentFound.depth + subtreeHeight(copy) > FRAME_MAX_DEPTH) {
+                setInlineError(strings.depthLimit)
+                continue
+              }
+            }
+            // A single duplicate keeps v1 behaviour (directly above the original); several
+            // duplicates from one gesture are appended so their indexes cannot fight each other.
+            const insertIndex = roots.length === 1 ? found.index + 1 : null
+            const subOps = insertOpsForSubtree(copy, destination, insertIndex)
+            if (subOps.length === 0) continue
+            if (ops.length + subOps.length > MAX_OPS_PER_BATCH) {
+              setInlineError(strings.duplicateTooLarge)
+              beacon('duplicate-rejected', { layerId: found.layer.id, ops: subOps.length })
               return false
             }
-            if (parentFound.depth + subtreeHeight(copy) > FRAME_MAX_DEPTH) {
-              setInlineError(strings.depthLimit)
-              return false
-            }
+            ops.push.apply(ops, subOps)
+            copies.push({ copy: copy, destination: destination, index: insertIndex })
+            boardId = found.artboard.id
           }
-          const index = found.index + 1
-          const ops = insertOpsForSubtree(copy, destination, index)
-          if (ops.length === 0) return false
-          // The Host caps ops per batch (default 200); a huge subtree cannot be copied at once.
-          if (ops.length > 200) {
-            setInlineError(strings.duplicateTooLarge)
-            beacon('duplicate-rejected', { layerId: layerId, ops: ops.length })
-            return false
+          if (copies.length === 0) return false
+          let next = current
+          for (let index = 0; index < copies.length; index += 1) {
+            next = docInsertLayers(next, copies[index].destination, [copies[index].copy], copies[index].index)
           }
-          applyDocLocal(docInsertLayer(current, destination, copy, index))
-          setSelectedLayerId(copy.id)
-          setSelectedArtboardId(found.artboard.id)
-          commitWithHistory('duplicate', ops, [{ type: 'layer.delete', layerId: copy.id }])
-          beacon('duplicate', { count: ops.length, layerId: copy.id, autoParent: autoParent })
+          applyDocLocal(next)
+          applySelection(
+            copies.map(function (item) { return item.copy.id }),
+            boardId,
+            null,
+          )
+          commitWithHistory(
+            'duplicate',
+            ops,
+            copies.map(function (item) {
+              return { type: 'layer.delete', layerId: item.copy.id }
+            }),
+          )
+          beacon('duplicate', { count: copies.length, ops: ops.length })
           return true
         } catch (error) {
           setInlineError(messageOf(error))
@@ -932,29 +1648,31 @@
         }
       }
 
-      function nudgeSelected(dx, dy) {
-        const layerId = selectedLayerIdRef.current
-        const current = docRef.current
-        if (!current || !layerId) return
-        const tree = treeRef.current
-        const node = tree && tree.byId ? tree.byId.get(layerId) || null : null
-        if (!node) return
-        if (node.autoParent) {
-          setInlineError(strings.nudgeAutoLayout)
-          beacon('nudge-blocked', { layerId: layerId, reason: 'auto-layout' })
-          return
+      function sameIdSet(first, second) {
+        if (!Array.isArray(first) || !Array.isArray(second)) return false
+        if (first.length !== second.length) return false
+        for (let index = 0; index < first.length; index += 1) {
+          if (first[index] !== second[index]) return false
         }
+        return true
+      }
+
+      /** Batched arrow-key nudge for the whole selection (one history entry per pause). */
+      function nudgeSelected(dx, dy) {
+        const current = docRef.current
+        const ids = selectedLayerIdsRef.current
+        if (!current || !ids.length) return
         const pending = nudgeRef.current
-        if (pending && pending.layerId !== layerId) {
-          // Commit the pending delta for the previous layer before starting a new batch.
+        if (pending) {
+          if (sameIdSet(pending.layerIds, ids)) {
+            pending.dx += dx
+            pending.dy += dy
+            return
+          }
           flushNudge()
-        } else if (pending) {
-          pending.dx += dx
-          pending.dy += dy
-          return
         }
         nudgeRef.current = {
-          layerId: layerId,
+          layerIds: ids.slice(),
           dx: dx,
           dy: dy,
           timer: setTimeout(flushNudge, NUDGE_BATCH_MS),
@@ -969,31 +1687,834 @@
           if (pending.timer) clearTimeout(pending.timer)
           const current = docRef.current
           if (!current) return
-          const found = findLayerById(current, pending.layerId)
-          if (!found) return
-          const tree = treeRef.current
-          const node = tree && tree.byId ? tree.byId.get(pending.layerId) || null : null
-          if (node && node.autoParent) return
-          const previousX = finiteNumber(found.layer.x, 0)
-          const previousY = finiteNumber(found.layer.y, 0)
-          const nextX = Math.round(previousX + pending.dx)
-          const nextY = Math.round(previousY + pending.dy)
-          if (nextX === previousX && nextY === previousY) return
-          patchLocalLayer(pending.layerId, { x: nextX, y: nextY })
-          commitWithHistory(
-            'nudge',
-            [{ type: 'layer.update', layerId: pending.layerId, patch: { x: nextX, y: nextY } }],
-            [
-              {
-                type: 'layer.update',
-                layerId: pending.layerId,
-                patch: { x: previousX, y: previousY },
-              },
-            ],
-          )
-          beacon('nudge', { dx: pending.dx, dy: pending.dy, layerId: pending.layerId })
+          const entries = []
+          const ops = []
+          const inverse = []
+          let blockedAuto = false
+          let blockedLocked = false
+          for (let index = 0; index < pending.layerIds.length; index += 1) {
+            const layerId = pending.layerIds[index]
+            const found = findLayerById(current, layerId)
+            if (!found) continue
+            const node = nodeForLayer(layerId)
+            if (node && node.autoParent) {
+              blockedAuto = true
+              continue
+            }
+            if (found.layer.locked === true) {
+              blockedLocked = true
+              continue
+            }
+            const previousX = finiteNumber(found.layer.x, 0)
+            const previousY = finiteNumber(found.layer.y, 0)
+            const nextX = Math.round(previousX + pending.dx)
+            const nextY = Math.round(previousY + pending.dy)
+            if (nextX === previousX && nextY === previousY) continue
+            entries.push({ layerId: layerId, patch: { x: nextX, y: nextY } })
+            ops.push({ type: 'layer.update', layerId: layerId, patch: { x: nextX, y: nextY } })
+            inverse.push({
+              type: 'layer.update',
+              layerId: layerId,
+              patch: { x: previousX, y: previousY },
+            })
+          }
+          if (blockedAuto) setInlineError(strings.nudgeAutoLayout)
+          if (blockedLocked) setInlineError(INTERACTION_COPY.locked)
+          if (ops.length === 0) return
+          applyDocLocal(docPatchLayers(current, entries))
+          commitWithHistory('nudge', ops, inverse)
+          beacon('nudge', { dx: pending.dx, dy: pending.dy, count: ops.length })
         } catch (error) {
           beacon('nudge-failed', { message: shortError(error) })
+        }
+      }
+
+      /* ------------------------------- selection groups, align, tidy ------------------------------- */
+
+      /**
+       * Selection roots grouped by parent container. Alignment/distribution/tidy work per parent so
+       * a layer is positioned relative to the artboard (direct child) or to its parent frame.
+       */
+      function selectionGroups() {
+        const current = docRef.current
+        const groups = []
+        if (!current) return groups
+        const roots = rootSelectionIds(selectedLayerIdsRef.current)
+        const byKey = new Map()
+        for (let index = 0; index < roots.length; index += 1) {
+          const found = findLayerById(current, roots[index])
+          if (!found) continue
+          const node = nodeForLayer(found.layer.id)
+          if (!node) continue
+          const key = found.parentId ? 'p:' + found.parentId : 'a:' + found.artboard.id
+          let group = byKey.get(key)
+          if (!group) {
+            const parentNode = node.parent || null
+            group = {
+              key: key,
+              parentId: found.parentId,
+              artboard: found.artboard,
+              parentNode: parentNode,
+              auto: !!node.autoParent,
+              nodes: [],
+              list: (parentNode ? childrenOf(parentNode.layer) : layersOf(found.artboard)).slice(),
+              box: parentNode
+                ? rectOf(0, 0, parentNode.width, parentNode.height)
+                : rectOf(0, 0, found.artboard.width, found.artboard.height),
+            }
+            byKey.set(key, group)
+            groups.push(group)
+          }
+          group.nodes.push(node)
+        }
+        return groups
+      }
+
+      /**
+       * An auto-layout parent owns its children's positions, so the only sane "move" there is the
+       * child order: normalize the stored order of the selected children to their visual order.
+       */
+      function visualOrderReorderOps(group, axis) {
+        if (!group || !group.auto || !group.parentNode) return null
+        const layout = normalizeLayoutObject(group.parentNode.layer.layout)
+        if (!layout) return null
+        const mainAxis = layout.direction === 'column' ? 'y' : 'x'
+        if (axis && axis !== mainAxis) return null
+        const list = group.list
+        const selectedSet = new Set(group.nodes.map(function (node) { return node.id }))
+        const sorted = group.nodes.slice().sort(function (first, second) {
+          return mainAxis === 'y' ? first.y - second.y : first.x - second.x
+        })
+        const slots = []
+        for (let index = 0; index < list.length; index += 1) {
+          if (list[index] && selectedSet.has(list[index].id)) slots.push(index)
+        }
+        if (slots.length < 2) return { forward: [], inverse: [] }
+        const target = list.slice()
+        for (let index = 0; index < slots.length; index += 1) {
+          if (sorted[index]) target[slots[index]] = sorted[index].layer
+        }
+        return {
+          forward: reorderOpsToReach(list, target),
+          inverse: reorderOpsToReach(target, list),
+        }
+      }
+
+      /**
+       * Align the selection's layers. `kind` is one of left, center-h, right, top, center-v,
+       * bottom. Absolute parents get real x/y math (relative to the artboard or parent frame);
+       * inside an auto-layout frame the main axis becomes an order change and the cross axis
+       * becomes `alignSelf`, because authored x/y are ignored there.
+       */
+      function alignSelection(kind) {
+        const spec = ALIGN_SPECS[kind]
+        const current = docRef.current
+        if (!current || !spec) return false
+        const roots = rootSelectionIds(selectedLayerIdsRef.current)
+        if (roots.length < 2) {
+          setInlineError(INTERACTION_COPY.alignNeedsTwo)
+          return false
+        }
+        const groups = selectionGroups()
+        if (!groups.length) return false
+        const entries = []
+        const ops = []
+        const inverse = []
+        let reorderForward = []
+        let reorderInverse = []
+        for (let groupIndex = 0; groupIndex < groups.length; groupIndex += 1) {
+          const group = groups[groupIndex]
+          const layout = group.auto ? normalizeLayoutObject(group.parentNode.layer.layout) : null
+          if (layout) {
+            const mainAxis = layout.direction === 'column' ? 'y' : 'x'
+            if (spec.axis === mainAxis) {
+              const selectedSet = new Set(group.nodes.map(function (node) { return node.id }))
+              const picked = group.list.filter(function (layer) {
+                return isObject(layer) && selectedSet.has(layer.id)
+              })
+              const rest = group.list.filter(function (layer) {
+                return isObject(layer) && !selectedSet.has(layer.id)
+              })
+              let insertAt = 0
+              if (spec.pos === 'end') insertAt = rest.length
+              else if (spec.pos === 'center') insertAt = Math.floor(rest.length / 2)
+              const target = rest.slice(0, insertAt).concat(picked).concat(rest.slice(insertAt))
+              reorderForward = reorderForward.concat(reorderOpsToReach(group.list, target))
+              reorderInverse = reorderInverse.concat(reorderOpsToReach(target, group.list))
+            } else {
+              const alignSelf = spec.pos === 'start' ? 'start' : spec.pos === 'end' ? 'end' : 'center'
+              for (let nodeIndex = 0; nodeIndex < group.nodes.length; nodeIndex += 1) {
+                const node = group.nodes[nodeIndex]
+                if (node.layer.alignSelf === alignSelf) continue
+                const patch = { alignSelf: alignSelf }
+                entries.push({ layerId: node.id, patch: patch })
+                ops.push({ type: 'layer.update', layerId: node.id, patch: patch })
+                inverse.push({
+                  type: 'layer.update',
+                  layerId: node.id,
+                  patch: inversePatchFor(node.layer, patch),
+                })
+              }
+            }
+            continue
+          }
+          for (let nodeIndex = 0; nodeIndex < group.nodes.length; nodeIndex += 1) {
+            const node = group.nodes[nodeIndex]
+            const patch = {}
+            if (spec.axis === 'x') {
+              const width = Math.max(1, finiteNumber(node.width, 1))
+              patch.x = Math.round(
+                spec.pos === 'start'
+                  ? 0
+                  : spec.pos === 'end'
+                    ? group.box.width - width
+                    : (group.box.width - width) / 2,
+              )
+            } else {
+              const height = Math.max(1, finiteNumber(node.height, 1))
+              patch.y = Math.round(
+                spec.pos === 'start'
+                  ? 0
+                  : spec.pos === 'end'
+                    ? group.box.height - height
+                    : (group.box.height - height) / 2,
+              )
+            }
+            const changed = patchDiff(node.layer, patch)
+            if (!changed) continue
+            entries.push({ layerId: node.id, patch: changed })
+            ops.push({ type: 'layer.update', layerId: node.id, patch: changed })
+            inverse.push({
+              type: 'layer.update',
+              layerId: node.id,
+              patch: inversePatchFor(node.layer, changed),
+            })
+          }
+        }
+        const forwardOps = ops.concat(reorderForward)
+        if (forwardOps.length === 0) return false
+        let next = docPatchLayers(current, entries)
+        for (let index = 0; index < reorderForward.length; index += 1) {
+          next = docReorderLayer(next, reorderForward[index].layerId, reorderForward[index].index)
+        }
+        applyDocLocal(next)
+        commitWithHistory('align', forwardOps, reorderInverse.concat(inverse))
+        beacon('selection-align', { kind: kind, count: forwardOps.length })
+        return true
+      }
+
+      /**
+       * Distribute equal gaps along `axis` ('x' horizontal / 'y' vertical), 3+ layers with the
+       * same parent. Inside an auto-layout parent the gaps belong to the frame, so this normalizes
+       * the child order along that frame's main axis instead (and is a no-op on the cross axis).
+       */
+      function distributeSelection(axis) {
+        const current = docRef.current
+        if (!current) return false
+        const direction = axis === 'y' || axis === 'vertical' ? 'y' : 'x'
+        const roots = rootSelectionIds(selectedLayerIdsRef.current)
+        if (roots.length < 3) {
+          setInlineError(INTERACTION_COPY.distributeNeedsThree)
+          return false
+        }
+        const groups = selectionGroups()
+        if (groups.length !== 1) {
+          setInlineError(INTERACTION_COPY.alignSameParent)
+          return false
+        }
+        const group = groups[0]
+        if (group.nodes.length < 3) {
+          setInlineError(INTERACTION_COPY.distributeNeedsThree)
+          return false
+        }
+        if (group.auto) {
+          const reorder = visualOrderReorderOps(group, direction)
+          if (!reorder || reorder.forward.length === 0) return false
+          let next = current
+          for (let index = 0; index < reorder.forward.length; index += 1) {
+            next = docReorderLayer(next, reorder.forward[index].layerId, reorder.forward[index].index)
+          }
+          applyDocLocal(next)
+          commitWithHistory('distribute', reorder.forward, reorder.inverse)
+          beacon('selection-distribute', { axis: direction, mode: 'order' })
+          return true
+        }
+        const nodes = group.nodes.slice().sort(function (first, second) {
+          return direction === 'x' ? first.x - second.x : first.y - second.y
+        })
+        const first = nodes[0]
+        const last = nodes[nodes.length - 1]
+        let total = 0
+        for (let index = 0; index < nodes.length; index += 1) {
+          total += Math.max(1, direction === 'x' ? nodes[index].width : nodes[index].height)
+        }
+        const span =
+          (direction === 'x' ? last.x + last.width : last.y + last.height) -
+          (direction === 'x' ? first.x : first.y)
+        const gap = (span - total) / (nodes.length - 1)
+        if (!Number.isFinite(gap)) return false
+        const entries = []
+        const ops = []
+        const inverse = []
+        let cursor = direction === 'x' ? first.x : first.y
+        for (let index = 0; index < nodes.length; index += 1) {
+          const node = nodes[index]
+          if (index > 0) {
+            const patch = {}
+            patch[direction] = Math.round(cursor)
+            const changed = patchDiff(node.layer, patch)
+            if (changed) {
+              entries.push({ layerId: node.id, patch: changed })
+              ops.push({ type: 'layer.update', layerId: node.id, patch: changed })
+              inverse.push({
+                type: 'layer.update',
+                layerId: node.id,
+                patch: inversePatchFor(node.layer, changed),
+              })
+            }
+          }
+          cursor += Math.max(1, direction === 'x' ? node.width : node.height) + gap
+        }
+        if (ops.length === 0) return false
+        applyDocLocal(docPatchLayers(current, entries))
+        commitWithHistory('distribute', ops, inverse)
+        beacon('selection-distribute', { axis: direction, mode: 'positions', gap: Math.round(gap) })
+        return true
+      }
+
+      /**
+       * Tidy up: arrange the selection into a single row or column with even spacing (TIDY_GAP),
+       * sharing one edge. Auto-layout parents get the equivalent: their child order is normalized.
+       */
+      function tidySelection(direction) {
+        const current = docRef.current
+        if (!current) return false
+        const mode = direction === 'column' ? 'column' : 'row'
+        const groups = selectionGroups()
+        if (!groups.length) return false
+        const entries = []
+        const ops = []
+        const inverse = []
+        let reorderForward = []
+        let reorderInverse = []
+        for (let groupIndex = 0; groupIndex < groups.length; groupIndex += 1) {
+          const group = groups[groupIndex]
+          if (group.auto) {
+            const reorder = visualOrderReorderOps(group, mode === 'column' ? 'y' : 'x')
+            if (!reorder) continue
+            reorderForward = reorderForward.concat(reorder.forward)
+            reorderInverse = reorderInverse.concat(reorder.inverse)
+            continue
+          }
+          if (group.nodes.length < 2) continue
+          const nodes = group.nodes.slice().sort(function (first, second) {
+            return mode === 'row' ? first.x - second.x : first.y - second.y
+          })
+          const box = unionRects(
+            group.nodes.map(function (node) {
+              return rectOf(node.x, node.y, node.width, node.height)
+            }),
+          )
+          if (!box) continue
+          let cursor = mode === 'row' ? box.x : box.y
+          for (let index = 0; index < nodes.length; index += 1) {
+            const node = nodes[index]
+            const patch =
+              mode === 'row'
+                ? { x: Math.round(cursor), y: Math.round(box.y) }
+                : { x: Math.round(box.x), y: Math.round(cursor) }
+            cursor += Math.max(1, mode === 'row' ? node.width : node.height) + TIDY_GAP
+            const changed = patchDiff(node.layer, patch)
+            if (!changed) continue
+            entries.push({ layerId: node.id, patch: changed })
+            ops.push({ type: 'layer.update', layerId: node.id, patch: changed })
+            inverse.push({
+              type: 'layer.update',
+              layerId: node.id,
+              patch: inversePatchFor(node.layer, changed),
+            })
+          }
+        }
+        const forwardOps = ops.concat(reorderForward)
+        if (forwardOps.length === 0) return false
+        let next = docPatchLayers(current, entries)
+        for (let index = 0; index < reorderForward.length; index += 1) {
+          next = docReorderLayer(next, reorderForward[index].layerId, reorderForward[index].index)
+        }
+        applyDocLocal(next)
+        commitWithHistory('tidy', forwardOps, reorderInverse.concat(inverse))
+        beacon('selection-tidy', { direction: mode })
+        return true
+      }
+
+      /* ------------------------------- group / ungroup ------------------------------- */
+
+      /**
+       * Group the selection with one `layer.group` op. The Host builds the group (union box, ids,
+       * relative child coordinates), so the local document is not patched optimistically; the id
+       * the Host assigned comes back in `applied[]` and becomes the selection.
+       */
+      async function groupSelection() {
+        const current = docRef.current
+        if (!current) return false
+        const roots = rootSelectionIds(selectedLayerIdsRef.current)
+        if (roots.length < 2) {
+          setInlineError(INTERACTION_COPY.groupNeedsTwo)
+          return false
+        }
+        const first = findLayerById(current, roots[0])
+        if (!first) return false
+        const parentKey = first.parentId ? 'p:' + first.parentId : 'a:' + first.artboard.id
+        for (let index = 1; index < roots.length; index += 1) {
+          const found = findLayerById(current, roots[index])
+          if (!found) continue
+          const key = found.parentId ? 'p:' + found.parentId : 'a:' + found.artboard.id
+          if (key !== parentKey) {
+            // layer.group has no parentId: grouping across containers would be ambiguous.
+            setInlineError(INTERACTION_COPY.groupSameParent)
+            return false
+          }
+        }
+        const op = { type: 'layer.group', layerIds: roots }
+        if (!first.parentId) op.artboardId = first.artboard.id
+        // The Host refuses to group auto-layout children (their x/y are derived); say it up front.
+        if (first.parentId) {
+          const parentFound = findLayerById(current, first.parentId)
+          if (parentFound && parentFound.layer.type === 'frame' && isObject(parentFound.layer.layout)) {
+            setInlineError(INTERACTION_COPY.groupAutoLayout)
+            return false
+          }
+        }
+        const result = await runOps([op])
+        if (!result || result.ok === false) return false
+        let groupId = null
+        const applied = Array.isArray(result.applied) ? result.applied : []
+        for (let index = 0; index < applied.length; index += 1) {
+          if (applied[index] && applied[index].type === 'layer.group' && applied[index].id) {
+            groupId = applied[index].id
+            break
+          }
+        }
+        if (!groupId) return false
+        pushHistoryEntry('group', [op], [{ type: 'layer.ungroup', layerId: groupId }])
+        applySelection([groupId], first.artboard.id, null)
+        beacon('selection-group', { groupId: groupId, members: roots.length })
+        return groupId
+      }
+
+      /**
+       * Ungroup every selected group. The inverse re-creates a group from the promoted children
+       * (which keep their ids), so undo restores the selection unit even though the Host assigns a
+       * fresh group id and box.
+       */
+      function ungroupSelection() {
+        const current = docRef.current
+        if (!current) return false
+        const roots = rootSelectionIds(selectedLayerIdsRef.current)
+        const targets = []
+        const promoted = []
+        for (let index = 0; index < roots.length; index += 1) {
+          const found = findLayerById(current, roots[index])
+          if (!found || found.layer.type !== 'group') continue
+          targets.push(found)
+          const kids = childrenOf(found.layer)
+          for (let childIndex = 0; childIndex < kids.length; childIndex += 1) {
+            if (kids[childIndex] && kids[childIndex].id) promoted.push(kids[childIndex].id)
+          }
+        }
+        if (targets.length === 0) {
+          setInlineError(INTERACTION_COPY.ungroupNeedsGroup)
+          return false
+        }
+        const ops = targets.map(function (found) {
+          return { type: 'layer.ungroup', layerId: found.layer.id }
+        })
+        const inverse = targets.map(function (found) {
+          const op = {
+            type: 'layer.group',
+            layerIds: childrenOf(found.layer).map(function (child) { return child.id }),
+          }
+          if (found.layer.name) op.name = found.layer.name
+          if (!found.parentId) op.artboardId = found.artboard.id
+          return op
+        })
+        commitWithHistory('ungroup', ops, inverse)
+        applySelection(promoted, targets[0].artboard.id, null)
+        beacon('selection-ungroup', { groups: targets.length, promoted: promoted.length })
+        return true
+      }
+
+      /** Lock / unlock the whole selection (locked layers stay selectable; gestures are blocked). */
+      function toggleLock() {
+        const current = docRef.current
+        const ids = selectedLayerIdsRef.current
+        if (!current || !ids.length) return false
+        let allLocked = true
+        for (let index = 0; index < ids.length; index += 1) {
+          const found = findLayerById(current, ids[index])
+          if (!found) continue
+          if (found.layer.locked !== true) allLocked = false
+        }
+        const nextLocked = !allLocked
+        const entries = []
+        const ops = []
+        const inverse = []
+        for (let index = 0; index < ids.length; index += 1) {
+          const found = findLayerById(current, ids[index])
+          if (!found) continue
+          if ((found.layer.locked === true) === nextLocked) continue
+          entries.push({ layerId: found.layer.id, patch: { locked: nextLocked } })
+          ops.push({ type: 'layer.update', layerId: found.layer.id, patch: { locked: nextLocked } })
+          inverse.push({
+            type: 'layer.update',
+            layerId: found.layer.id,
+            patch: { locked: found.layer.locked === true },
+          })
+        }
+        if (ops.length === 0) return false
+        applyDocLocal(docPatchLayers(current, entries))
+        commitWithHistory(nextLocked ? 'lock' : 'unlock', ops, inverse)
+        beacon('selection-lock', { locked: nextLocked, count: ops.length })
+        return true
+      }
+
+      /** Move every selected root into another frame/group or back to an artboard root. */
+      function reparentSelection(destination) {
+        const current = docRef.current
+        if (!current || !isObject(destination)) return false
+        const targetParentId =
+          typeof destination.parentId === 'string' && destination.parentId
+            ? destination.parentId
+            : null
+        const targetArtboardId =
+          typeof destination.artboardId === 'string' && destination.artboardId
+            ? destination.artboardId
+            : null
+        if (!targetParentId && !targetArtboardId) return false
+        const roots = rootSelectionIds(selectedLayerIdsRef.current)
+        if (!roots.length) return false
+        const ops = []
+        const inverse = []
+        let next = current
+        for (let index = 0; index < roots.length; index += 1) {
+          const found = findLayerById(next, roots[index])
+          if (!found) continue
+          const sameParent = targetParentId
+            ? targetParentId === found.parentId
+            : !found.parentId && targetArtboardId === found.artboard.id
+          if (sameParent) continue
+          let insertIndex = 0
+          if (targetParentId) {
+            const parentFound = findLayerById(next, targetParentId)
+            if (!parentFound || !isContainerLayer(parentFound.layer)) {
+              setInlineError(strings.reparentFailed)
+              continue
+            }
+            if (isContainerLayer(found.layer) && subtreeContains(found.layer, targetParentId)) {
+              setInlineError(strings.reparentFailed)
+              continue
+            }
+            if (parentFound.depth + subtreeHeight(found.layer) > FRAME_MAX_DEPTH) {
+              setInlineError(strings.depthLimit)
+              continue
+            }
+            insertIndex = childrenOf(parentFound.layer).length
+          } else {
+            const board = findArtboardById(next, targetArtboardId)
+            if (!board) {
+              setInlineError(strings.reparentFailed)
+              continue
+            }
+            insertIndex = layersOf(board).length
+          }
+          const moveDestination = targetParentId
+            ? { parentId: targetParentId }
+            : { artboardId: targetArtboardId }
+          const moved = docMoveLayer(next, found.layer.id, moveDestination, insertIndex)
+          if (moved === next) continue
+          next = moved
+          const op = { type: 'layer.move_to', layerId: found.layer.id, index: insertIndex }
+          if (targetParentId) op.parentId = targetParentId
+          else op.artboardId = targetArtboardId
+          ops.push(op)
+          inverse.push.apply(inverse, inverseMoveToOps(found))
+        }
+        if (ops.length === 0) return false
+        applyDocLocal(next)
+        inverse.reverse()
+        commitWithHistory('reparent', ops, inverse)
+        if (targetArtboardId) setSelectedArtboardId(targetArtboardId)
+        beacon('selection-reparent', { count: ops.length })
+        return true
+      }
+
+      /* ------------------------------- clipboard ------------------------------- */
+
+      function writeClipboardText(text) {
+        try {
+          const nav = typeof navigator !== 'undefined' ? navigator : null
+          if (!nav || !nav.clipboard || typeof nav.clipboard.writeText !== 'function') return
+          const pending = nav.clipboard.writeText(text)
+          if (pending && typeof pending.catch === 'function') {
+            pending.catch(function () {
+              /* OS clipboard writes are best-effort; the in-memory tree still works */
+            })
+          }
+        } catch (error) {
+          /* ignore */
+        }
+      }
+
+      function readClipboardText() {
+        try {
+          const nav = typeof navigator !== 'undefined' ? navigator : null
+          if (!nav || !nav.clipboard || typeof nav.clipboard.readText !== 'function') {
+            return Promise.resolve('')
+          }
+          const pending = nav.clipboard.readText()
+          if (pending && typeof pending.then === 'function') {
+            return pending.catch(function () { return '' })
+          }
+          return Promise.resolve('')
+        } catch (error) {
+          return Promise.resolve('')
+        }
+      }
+
+      function parseClipboardPayload(text) {
+        if (typeof text !== 'string' || !text.trim()) return null
+        try {
+          const parsed = JSON.parse(text)
+          if (!isObject(parsed)) return null
+          if (parsed.kind !== CLIPBOARD_KIND) return null
+          if (!Array.isArray(parsed.layers) || parsed.layers.length === 0) return null
+          return parsed
+        } catch (error) {
+          return null
+        }
+      }
+
+      /** Copy the selection into the internal clipboard ref + the OS clipboard as JSON. */
+      function copySelection() {
+        try {
+          const current = docRef.current
+          if (!current) return false
+          const roots = rootSelectionIds(selectedLayerIdsRef.current)
+          if (!roots.length) return false
+          const layers = []
+          for (let index = 0; index < roots.length; index += 1) {
+            const found = findLayerById(current, roots[index])
+            if (found) layers.push(cloneLayerSubtree(found.layer, 0, 0))
+          }
+          if (!layers.length) return false
+          const payload = { kind: CLIPBOARD_KIND, version: 1, layers: layers }
+          clipboardRef.current = payload
+          let text = ''
+          try {
+            text = JSON.stringify(payload)
+          } catch (error) {
+            text = ''
+          }
+          if (text) writeClipboardText(text)
+          beacon('clipboard-copy', { count: layers.length })
+          return true
+        } catch (error) {
+          beacon('clipboard-copy-failed', { message: shortError(error) })
+          return false
+        }
+      }
+
+      function cutSelection() {
+        if (!copySelection()) return false
+        deleteSelectedLayer()
+        return true
+      }
+
+      /** Destination for a paste: the selected container, else the primary layer's parent/board. */
+      function pasteDestination() {
+        const current = docRef.current
+        if (!current) return null
+        const primaryId = selectedLayerIdRef.current
+        const primaryNode = primaryId ? nodeForLayer(primaryId) : null
+        const primaryFound = primaryId ? findLayerById(current, primaryId) : null
+        if (primaryNode && isContainerLayer(primaryNode.layer)) {
+          return { parentId: primaryNode.layer.id, parentNode: primaryNode }
+        }
+        if (primaryFound && primaryFound.parentId) {
+          return { parentId: primaryFound.parentId, parentNode: nodeForLayer(primaryFound.parentId) }
+        }
+        if (primaryFound) return { artboardId: primaryFound.artboard.id, parentNode: null }
+        let board = selectedArtboardIdRef.current
+          ? findArtboardById(current, selectedArtboardIdRef.current)
+          : null
+        if (!board) board = artboardsOf(current).find(function (artboard) { return isObject(artboard) }) || null
+        if (!board) return null
+        return { artboardId: board.id, parentNode: null }
+      }
+
+      /** Insert cloned clipboard layers into the paste destination (one history entry). */
+      function insertPastedLayers(layers) {
+        const current = docRef.current
+        if (!current || !Array.isArray(layers) || !layers.length) return false
+        const destination = pasteDestination()
+        if (!destination) {
+          setInlineError(strings.noArtboards)
+          return false
+        }
+        const destinationNode = destination.parentNode || null
+        const destinationLayer = destinationNode
+          ? destinationNode.layer
+          : destination.artboardId
+            ? findArtboardById(current, destination.artboardId)
+            : null
+        if (!destinationLayer) return false
+        if (destinationNode) {
+          if (destinationNode.depth >= FRAME_MAX_DEPTH) {
+            setInlineError(strings.depthLimit)
+            return false
+          }
+          if (
+            childrenOf(destinationLayer).length + layers.length >
+            FRAME_MAX_CHILDREN
+          ) {
+            setInlineError(strings.childLimit)
+            return false
+          }
+        }
+        const autoDestination =
+          destinationNode &&
+          destinationNode.layer.type === 'frame' &&
+          !!normalizeLayoutObject(destinationNode.layer.layout)
+        const offset = autoDestination ? 0 : PASTE_OFFSET
+        const copies = []
+        const ops = []
+        for (let index = 0; index < layers.length; index += 1) {
+          const clone = cloneLayerSubtree(layers[index], offset, offset)
+          if (!clone) continue
+          if (destinationNode && destinationNode.depth + subtreeHeight(clone) > FRAME_MAX_DEPTH) {
+            setInlineError(strings.depthLimit)
+            continue
+          }
+          const subOps = insertOpsForSubtree(
+            clone,
+            destination.parentId ? { parentId: destination.parentId } : { artboardId: destination.artboardId },
+            null,
+          )
+          if (subOps.length === 0) continue
+          if (ops.length + subOps.length > MAX_OPS_PER_BATCH) {
+            setInlineError(INTERACTION_COPY.pasteLimit)
+            return false
+          }
+          ops.push.apply(ops, subOps)
+          copies.push(clone)
+        }
+        if (copies.length === 0) return false
+        const next = docInsertLayers(
+          current,
+          destination.parentId ? { parentId: destination.parentId } : { artboardId: destination.artboardId },
+          copies,
+        )
+        applyDocLocal(next)
+        const boardId =
+          destination.artboardId ||
+          (destinationNode ? artboardIdForNode(destinationNode) : null) ||
+          selectedArtboardIdRef.current
+        applySelection(
+          copies.map(function (clone) { return clone.id }),
+          boardId,
+          null,
+        )
+        commitWithHistory(
+          'paste',
+          ops,
+          copies.map(function (clone) {
+            return { type: 'layer.delete', layerId: clone.id }
+          }),
+        )
+        beacon('clipboard-paste', { count: copies.length, ops: ops.length })
+        return true
+      }
+
+      /**
+       * Paste layers from the internal clipboard (survives in-tab), falling back to the JSON we
+       * wrote to the OS clipboard so a reload or another tab can still paste.
+       */
+      function pasteSelection() {
+        let payload = clipboardRef.current
+        if (!isObject(payload) || !Array.isArray(payload.layers) || payload.layers.length === 0) {
+          return readClipboardText().then(function (text) {
+            const parsed = parseClipboardPayload(text)
+            if (!parsed) {
+              setInlineError(INTERACTION_COPY.pasteEmpty)
+              return false
+            }
+            clipboardRef.current = parsed
+            return insertPastedLayers(parsed.layers)
+          })
+        }
+        return Promise.resolve(insertPastedLayers(payload.layers))
+      }
+
+      /* ------------------------------- presets ------------------------------- */
+
+      /**
+       * Toolbar action for the chrome agent: a ready-made button (auto-layout frame + label) in
+       * the selected container/artboard, one history entry.
+       */
+      function addButtonPreset() {
+        try {
+          const current = docRef.current
+          if (!current) return false
+          const boards = artboardsOf(current)
+          const primaryId = selectedLayerIdRef.current
+          const primaryNode = primaryId ? nodeForLayer(primaryId) : null
+          const primaryFound = primaryId ? findLayerById(current, primaryId) : null
+          let artboard = primaryFound ? primaryFound.artboard : null
+          if (!artboard && selectedArtboardIdRef.current) {
+            artboard = findArtboardById(current, selectedArtboardIdRef.current)
+          }
+          if (!artboard) artboard = boards.find(function (board) { return isObject(board) }) || null
+          if (!artboard) {
+            setInlineError(strings.noArtboards)
+            return false
+          }
+          const containerNode =
+            primaryNode && isContainerLayer(primaryNode.layer) ? primaryNode : null
+          const destination = containerNode
+            ? { parentId: containerNode.layer.id }
+            : { artboardId: artboard.id }
+          if (containerNode) {
+            if (containerNode.depth >= FRAME_MAX_DEPTH) {
+              setInlineError(strings.depthLimit)
+              return false
+            }
+            if (childrenOf(containerNode.layer).length + 1 > FRAME_MAX_CHILDREN) {
+              setInlineError(strings.childLimit)
+              return false
+            }
+          }
+          const preset = createButtonPresetLayers(containerNode ? containerNode.layer : artboard)
+          const frameOp = { type: 'layer.add', layer: opLayerForAdd(preset.frame) }
+          if (destination.parentId) frameOp.parentId = destination.parentId
+          else frameOp.artboardId = destination.artboardId
+          const textOp = {
+            type: 'layer.add',
+            parentId: preset.frame.id,
+            layer: preset.text,
+          }
+          let next = docInsertLayer(current, destination, preset.frame)
+          next = docInsertLayer(next, { parentId: preset.frame.id }, preset.text)
+          applyDocLocal(next)
+          applySelection([preset.frame.id], artboard.id, null)
+          commitWithHistory('add-button', [frameOp, textOp], [
+            { type: 'layer.delete', layerId: preset.frame.id },
+          ])
+          beacon('button-preset-add', { artboardId: artboard.id })
+          return true
+        } catch (error) {
+          setInlineError(messageOf(error))
+          beacon('button-preset-failed', { message: shortError(error) })
+          return false
         }
       }
 
@@ -1270,6 +2791,22 @@
 
       /* ------------------------------- pointer gestures ------------------------------- */
 
+      /**
+       * v2 batch API (CONTRACT §6): send ONE chat message for many comments. The builder lives in
+       * 53-batch.js and is hoisted; the editor contributes the live document/context.
+       */
+      function submitCommentsFor(commentIds) {
+        return submitComments(commentIds, {
+          doc: docRef.current,
+          tree: treeRef.current,
+          version: versionRef.current,
+          boardPath: boardPath,
+          strings: strings,
+          editor: { sendCommentChat: sendCommentChat, runOps: runOps },
+          actions: { selectLayer: selectLayer, selectArtboard: selectArtboard },
+        })
+      }
+
       /** Patch for a layer gesture. `resize-auto` children only get width/height (never x/y). */
       function gesturePatch(gesture, dx, dy) {
         const origin = gesture.origin
@@ -1314,15 +2851,131 @@
         }
       }
 
+      /**
+       * Layers that take part in one drag: the whole selection when the grabbed layer is part of
+       * it, otherwise just the grabbed layer. Auto-layout children (their x/y are derived) and
+       * locked layers are left out; `blocked*` flags let the caller surface why.
+       */
+      function gestureMembersFor(grabbedId, multi) {
+        const current = docRef.current
+        const result = { members: [], blockedLocked: false, blockedAuto: false }
+        if (!current) return result
+        let ids = multi ? rootSelectionIds(selectedLayerIdsRef.current) : [grabbedId]
+        if (ids.indexOf(grabbedId) < 0) ids = [grabbedId]
+        for (let index = 0; index < ids.length; index += 1) {
+          const layerId = ids[index]
+          const found = findLayerById(current, layerId)
+          if (!found) continue
+          const node = nodeForLayer(layerId)
+          if (node && node.autoParent) {
+            result.blockedAuto = true
+            continue
+          }
+          if (found.layer.locked === true) {
+            result.blockedLocked = true
+            continue
+          }
+          result.members.push({
+            layerId: layerId,
+            parentId: found.parentId,
+            artboardId: found.artboard.id,
+            origin: {
+              x: finiteNumber(found.layer.x, 0),
+              y: finiteNumber(found.layer.y, 0),
+              width: Math.max(1, finiteNumber(found.layer.width, 1)),
+              height: Math.max(1, finiteNumber(found.layer.height, 1)),
+            },
+          })
+        }
+        return result
+      }
+
+      /** Layer update entries for the current gesture delta (absolute, so preview is idempotent). */
+      function gesturePatchEntries(gesture) {
+        if (!gesture || !Array.isArray(gesture.members)) return []
+        const dx = finiteNumber(gesture.dx, 0)
+        const dy = finiteNumber(gesture.dy, 0)
+        const entries = []
+        if (gesture.kind === 'drag') {
+          for (let index = 0; index < gesture.members.length; index += 1) {
+            const member = gesture.members[index]
+            entries.push({
+              layerId: member.layerId,
+              patch: {
+                x: Math.round(member.origin.x + dx),
+                y: Math.round(member.origin.y + dy),
+              },
+            })
+          }
+          return entries
+        }
+        // Resize handles belong to the primary layer only.
+        const patch = gesturePatch(gesture, dx, dy)
+        if (patch) entries.push({ layerId: gesture.layerId, patch: patch })
+        return entries
+      }
+
+      function cancelGestureFrame() {
+        const frame = gestureFrameRef.current
+        if (frame !== null && typeof cancelAnimationFrame === 'function') {
+          try {
+            cancelAnimationFrame(frame)
+          } catch (error) {
+            /* ignore */
+          }
+        }
+        gestureFrameRef.current = null
+      }
+
+      /** Coalesce pointer previews to one document update per animation frame (N=50 stays smooth). */
+      function scheduleGesturePreview() {
+        if (gestureFrameRef.current !== null) return
+        if (typeof requestAnimationFrame !== 'function') {
+          flushGesturePreview()
+          return
+        }
+        gestureFrameRef.current = requestAnimationFrame(function () {
+          gestureFrameRef.current = null
+          flushGesturePreview()
+        })
+      }
+
+      function flushGesturePreview() {
+        const gesture = gestureRef.current
+        const current = docRef.current
+        if (!gesture || !current) return
+        const entries = gesturePatchEntries(gesture)
+        if (!entries.length) return
+        applyDocLocal(docPatchLayers(current, entries))
+      }
+
       function beginGesture(event, node, handle) {
         if (!node || !isObject(node.layer)) return
         if (event.pointerType === 'mouse' && event.button !== 0) return
         if (spaceHeldRef.current || isMiddlePointer(event)) return
-        const found = docRef.current ? findLayerById(docRef.current, node.layer.id) : null
+        const current = docRef.current
+        const found = current ? findLayerById(current, node.layer.id) : null
         if (!found) return
         // Commit any batched arrow-key nudge before a pointer gesture starts.
         flushNudge()
         const autoParent = !!node.autoParent
+        // Locked layers stay selectable, but direct manipulation is refused (CONTRACT §1).
+        if (!autoParent && found.layer.locked === true) {
+          setInlineError(INTERACTION_COPY.locked)
+          beacon('gesture-blocked', { layerId: found.layer.id, reason: 'locked' })
+          return
+        }
+        const selectedIds = selectedLayerIdsRef.current
+        const multi =
+          !handle && !autoParent && selectedIds.length > 1 && selectedIds.indexOf(found.layer.id) >= 0
+        const collected = gestureMembersFor(found.layer.id, multi)
+        const members = collected.members
+        if (members.length === 0) {
+          if (collected.blockedLocked) setInlineError(INTERACTION_COPY.locked)
+          else if (collected.blockedAuto) setInlineError(strings.nudgeAutoLayout)
+          return
+        }
+        if (collected.blockedLocked) setInlineError(INTERACTION_COPY.locked)
         event.preventDefault()
         event.stopPropagation()
         const target = event.currentTarget
@@ -1333,6 +2986,32 @@
         } catch (error) {
           /* pointer capture is best-effort */
         }
+        // Snapping targets are captured once: siblings of the grabbed layer plus the parent box
+        // and the artboard box. They do not move while the gesture runs.
+        const snapStatic = []
+        const memberIds = new Set(
+          members.map(function (member) { return member.layerId }),
+        )
+        const primaryNode = nodeForLayer(found.layer.id)
+        const siblingNodes = siblingNodesOf(primaryNode)
+        for (let index = 0; index < siblingNodes.length; index += 1) {
+          const sibling = siblingNodes[index]
+          if (!sibling || memberIds.has(sibling.id)) continue
+          if (sibling.layer && sibling.layer.visible === false) continue
+          snapStatic.push(sibling.worldRect)
+        }
+        const parentNode = primaryNode ? primaryNode.parent || null : null
+        let frameRect = rectOf(0, 0, found.artboard.width, found.artboard.height)
+        if (parentNode && parentNode.worldRect) frameRect = parentNode.worldRect
+        const movingNodes = members
+          .map(function (member) { return nodeForLayer(member.layerId) })
+          .filter(function (item) { return !!item })
+        const selectionBox =
+          unionRects(
+            movingNodes.map(function (item) {
+              return item.worldRect
+            }),
+          ) || rectOf(0, 0, 1, 1)
         gestureRef.current = {
           pointerId: event.pointerId,
           kind: handle
@@ -1343,7 +3022,7 @@
               ? 'reorder'
               : 'drag',
           handle: handle || null,
-          layerId: node.layer.id,
+          layerId: found.layer.id,
           artboardId: found.artboard.id,
           parentId: found.parentId,
           autoParent: autoParent,
@@ -1357,6 +3036,14 @@
             width: Math.max(1, finiteNumber(found.layer.width, 1)),
             height: Math.max(1, finiteNumber(found.layer.height, 1)),
           },
+          members: members,
+          multi: members.length > 1,
+          selectionBox: selectionBox,
+          snapStatic: snapStatic,
+          frameRect: frameRect,
+          dx: null,
+          dy: null,
+          guidesActive: false,
           moved: false,
         }
         setGestureActive(true)
@@ -1374,8 +3061,49 @@
           openComposerFor(found.layer.id, found.artboard.id)
           return
         }
-        selectLayer(found.layer.id, found.artboard.id)
-        beginGesture(event, node, null)
+        // Double-click (two pointerdowns on the same layer inside DOUBLE_CLICK_MS) drills into
+        // the containing group and selects the child — no drag starts on the second press.
+        const now = Date.now()
+        const previous = lastLayerPointerRef.current
+        const isDouble = !!(
+          previous &&
+          previous.layerId === found.layer.id &&
+          now - previous.time < DOUBLE_CLICK_MS
+        )
+        lastLayerPointerRef.current = { layerId: found.layer.id, time: now }
+        if (isDouble) {
+          lastLayerPointerRef.current = null
+          event.preventDefault()
+          event.stopPropagation()
+          drillIntoNode(node)
+          return
+        }
+        const additive = !!(event.shiftKey || event.ctrlKey || event.metaKey)
+        if (additive) {
+          // Shift / Ctrl / Cmd+click toggles membership; it never starts a drag.
+          selectLayer(found.layer.id, found.artboard.id, { additive: true })
+          event.preventDefault()
+          event.stopPropagation()
+          return
+        }
+        const targetNode = selectionTargetForNode(node, drillGroupIdRef.current) || node
+        const targetId = targetNode.id || found.layer.id
+        const currentIds = selectedLayerIdsRef.current
+        if (currentIds.indexOf(targetId) >= 0) {
+          // Pressing on a layer that is already selected keeps the whole selection (Figma-like) so
+          // the press can drag every selected layer; the pressed one becomes the primary.
+          if (currentIds.length > 1) {
+            const nextIds = currentIds
+              .filter(function (layerId) { return layerId !== targetId })
+              .concat([targetId])
+            applySelection(nextIds, artboardIdForNode(targetNode) || found.artboard.id, drillGroupIdRef.current)
+          }
+        } else {
+          // Plain click replaces the selection with the Figma-like target (group or child).
+          selectLayer(found.layer.id, found.artboard.id)
+        }
+        const gestureNode = nodeForLayer(targetId) || targetNode || node
+        beginGesture(event, gestureNode, null)
       }
 
       function handlePointerDown(event, handle) {
@@ -1385,6 +3113,69 @@
         const node = tree && layerId && tree.byId ? tree.byId.get(layerId) || null : null
         if (!node) return
         beginGesture(event, node, handle)
+      }
+
+      /**
+       * Alt+drag (Figma): leave the originals where they were and drop duplicates at the pointer.
+       * One document update + one history entry; the copies become the selection.
+       */
+      function applyAltDragDuplicate(gesture, dx, dy) {
+        try {
+          const current = docRef.current
+          if (!current) return false
+          const members = Array.isArray(gesture.members) ? gesture.members : []
+          if (!members.length) return false
+          // The drag preview moved the originals locally; put them back before copying.
+          const restore = members.map(function (member) {
+            return { layerId: member.layerId, patch: { x: member.origin.x, y: member.origin.y } }
+          })
+          let next = docPatchLayers(current, restore)
+          const copies = []
+          const ops = []
+          for (let index = 0; index < members.length; index += 1) {
+            const member = members[index]
+            const found = findLayerById(next, member.layerId)
+            if (!found) continue
+            const copy = cloneLayerSubtree(found.layer, 0, 0)
+            if (!copy) continue
+            copy.x = Math.round(member.origin.x + dx)
+            copy.y = Math.round(member.origin.y + dy)
+            const destination = found.parentId
+              ? { parentId: found.parentId }
+              : { artboardId: found.artboard.id }
+            const subOps = insertOpsForSubtree(copy, destination, null)
+            if (subOps.length === 0) continue
+            if (ops.length + subOps.length > MAX_OPS_PER_BATCH) {
+              setInlineError(strings.duplicateTooLarge)
+              return false
+            }
+            ops.push.apply(ops, subOps)
+            copies.push({ copy: copy, destination: destination })
+          }
+          if (copies.length === 0) return false
+          for (let index = 0; index < copies.length; index += 1) {
+            next = docInsertLayers(next, copies[index].destination, [copies[index].copy])
+          }
+          applyDocLocal(next)
+          applySelection(
+            copies.map(function (item) { return item.copy.id }),
+            gesture.artboardId,
+            null,
+          )
+          commitWithHistory(
+            'duplicate-drag',
+            ops,
+            copies.map(function (item) {
+              return { type: 'layer.delete', layerId: item.copy.id }
+            }),
+          )
+          beacon('duplicate-drag', { count: copies.length, ops: ops.length })
+          return true
+        } catch (error) {
+          setInlineError(messageOf(error))
+          beacon('duplicate-drag-failed', { message: shortError(error) })
+          return false
+        }
       }
 
       /** Insertion index inside an auto-layout parent, from the pointer's main-axis position. */
@@ -1422,15 +3213,173 @@
         return clamp(index, 0, Math.max(0, siblings.length - 1))
       }
 
+      /* ------------------------------- marquee selection ------------------------------- */
+
+      /** Ids a marquee rect selects in an artboard (container-aware, group-collapsed). */
+      function marqueeSelectionIds(artboardId, rect) {
+        const tree = treeRef.current
+        if (!tree || !Array.isArray(tree.artboards) || !isObject(rect)) return []
+        const entry = tree.artboards.find(function (item) {
+          return item && item.artboard && item.artboard.id === artboardId
+        })
+        if (!entry) return []
+        const ids = []
+        const seen = new Set()
+        const drill = drillGroupIdRef.current
+        function addTarget(node) {
+          const target = selectionTargetForNode(node, drill) || node
+          if (!target || !target.id || seen.has(target.id)) return
+          seen.add(target.id)
+          ids.push(target.id)
+        }
+        function visit(nodes) {
+          const list = Array.isArray(nodes) ? nodes : []
+          for (let index = 0; index < list.length; index += 1) {
+            const node = list[index]
+            if (!node || !node.layer || node.layer.visible === false) continue
+            if (!rectsIntersect(rect, node.worldRect)) continue
+            const container = isContainerLayer(node.layer)
+            // A fully covered container is selected as a unit (a whole frame/group, Figma-like).
+            if (!container || rectContainsRect(rect, node.worldRect)) {
+              addTarget(node)
+              continue
+            }
+            const before = ids.length
+            visit(node.children)
+            if (ids.length === before) addTarget(node)
+          }
+        }
+        visit(entry.layers)
+        return ids
+      }
+
+      function removeMarqueeListeners(active) {
+        if (!active || typeof window === 'undefined' || typeof window.removeEventListener !== 'function') {
+          return
+        }
+        try {
+          window.removeEventListener('pointermove', active.onMove)
+          window.removeEventListener('pointerup', active.onUp)
+          window.removeEventListener('pointercancel', active.onCancel)
+        } catch (error) {
+          /* ignore */
+        }
+      }
+
+      function marqueeMove(active, event) {
+        if (!event || !active || event.pointerId !== active.pointerId) return
+        const total =
+          Math.abs(finiteNumber(event.clientX, active.startX) - active.startX) +
+          Math.abs(finiteNumber(event.clientY, active.startY) - active.startY)
+        if (!active.moved && total < PAN_START_THRESHOLD) return
+        active.moved = true
+        setGestureActive(true)
+        const point = screenToCanvas(event.clientX, event.clientY)
+        const rect = rectFromPoints(active.start, {
+          x: point.x - active.originX,
+          y: point.y - active.originY,
+        })
+        setMarquee({
+          artboardId: active.artboardId,
+          x: Math.round(rect.x),
+          y: Math.round(rect.y),
+          width: Math.round(rect.width),
+          height: Math.round(rect.height),
+        })
+      }
+
+      function endMarquee(active, cancelled) {
+        removeMarqueeListeners(active)
+        if (marqueeRef.current === active) marqueeRef.current = null
+        setMarquee(null)
+        setGestureActive(false)
+      }
+
+      function marqueeUp(active, event) {
+        if (!active || !event || event.pointerId !== active.pointerId) return
+        endMarquee(active, false)
+        if (!active.moved) {
+          // A plain click on the artboard background keeps its v1 meaning.
+          selectArtboard(active.artboardId)
+          return
+        }
+        const point = screenToCanvas(event.clientX, event.clientY)
+        const rect = rectFromPoints(active.start, {
+          x: point.x - active.originX,
+          y: point.y - active.originY,
+        })
+        const ids = marqueeSelectionIds(active.artboardId, rect)
+        const existing = selectedLayerIdsRef.current
+        const nextIds = active.additive
+          ? existing.concat(
+              ids.filter(function (layerId) { return existing.indexOf(layerId) < 0 }),
+            )
+          : ids
+        applySelection(nextIds, active.artboardId, drillGroupIdRef.current)
+        beacon('marquee-select', { count: ids.length, additive: active.additive })
+      }
+
+      function marqueeCancel(active, event) {
+        if (!active || !event || event.pointerId !== active.pointerId) return
+        endMarquee(active, true)
+      }
+
+      function beginMarquee(event, artboardId) {
+        if (!event || event.button !== 0 || marqueeRef.current) return
+        const current = docRef.current
+        if (!current) return
+        const layoutInfo = computeLayout(current)
+        const entry = layoutInfo.entryById.get(artboardId) || null
+        if (!entry) return
+        const point = screenToCanvas(event.clientX, event.clientY)
+        const active = {
+          pointerId: event.pointerId,
+          artboardId: artboardId,
+          additive: !!event.shiftKey,
+          startX: finiteNumber(event.clientX, 0),
+          startY: finiteNumber(event.clientY, 0),
+          originX: entry.frameX,
+          originY: entry.frameY,
+          start: { x: point.x - entry.frameX, y: point.y - entry.frameY },
+          moved: false,
+          onMove: null,
+          onUp: null,
+          onCancel: null,
+        }
+        active.onMove = function (moveEvent) { marqueeMove(active, moveEvent) }
+        active.onUp = function (upEvent) { marqueeUp(active, upEvent) }
+        active.onCancel = function (cancelEvent) { marqueeCancel(active, cancelEvent) }
+        marqueeRef.current = active
+        if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+          window.addEventListener('pointermove', active.onMove)
+          window.addEventListener('pointerup', active.onUp)
+          window.addEventListener('pointercancel', active.onCancel)
+        }
+        try {
+          if (typeof event.preventDefault === 'function') event.preventDefault()
+          if (typeof event.stopPropagation === 'function') event.stopPropagation()
+        } catch (error) {
+          /* ignore */
+        }
+      }
+
+      function cancelMarquee() {
+        const active = marqueeRef.current
+        if (!active) return false
+        endMarquee(active, true)
+        return true
+      }
+
       function artboardPointerDown(event, artboardId) {
         if (!event || spaceHeldRef.current || isMiddlePointer(event)) return
+        if (commentMode) return
         const target = event.target
         if (!target || !target.classList) return
         if (
           target.classList.contains('dc-board-frame') ||
           target.classList.contains('dc-board-inner')
         ) {
-          selectArtboard(artboardId)
+          beginMarquee(event, artboardId)
         }
       }
 
@@ -1447,10 +3396,41 @@
         if (gesture.kind === 'reorder') return
         // Screen pixels -> canvas units: always divide by the camera zoom. Nested parents
         // have no extra scale, so this is also the parent-relative delta.
-        const dx = screenDeltaToCanvas(gesture.clientX - gesture.startX, cameraRef.current.zoom)
-        const dy = screenDeltaToCanvas(gesture.clientY - gesture.startY, cameraRef.current.zoom)
-        const patch = gesturePatch(gesture, dx, dy)
-        if (patch) patchLocalLayer(gesture.layerId, patch)
+        const zoom = cameraRef.current.zoom > 0 ? cameraRef.current.zoom : 1
+        const rawDx = screenDeltaToCanvas(gesture.clientX - gesture.startX, zoom)
+        const rawDy = screenDeltaToCanvas(gesture.clientY - gesture.startY, zoom)
+        let dx = rawDx
+        let dy = rawDy
+        // Snap guides: edges/centers of siblings and of the parent/artboard box, Alt disables.
+        const canSnap =
+          gesture.kind === 'drag' && snapEnabledRef.current && !event.altKey && !spaceHeldRef.current
+        if (canSnap) {
+          const snapped = snapMovingBox(
+            gesture.selectionBox,
+            gesture.snapStatic,
+            gesture.frameRect,
+            rawDx,
+            rawDy,
+            SNAP_THRESHOLD_SCREEN / zoom,
+          )
+          dx = snapped.dx
+          dy = snapped.dy
+          const active = snapped.guides.length > 0
+          if (active !== gesture.guidesActive) {
+            gesture.guidesActive = active
+            setSnapGuides(active ? snapped.guides : [])
+            setSnapGuidesArtboardId(active ? gesture.artboardId : null)
+          } else if (active) {
+            setSnapGuides(snapped.guides)
+          }
+        } else if (gesture.guidesActive) {
+          gesture.guidesActive = false
+          setSnapGuides([])
+          setSnapGuidesArtboardId(null)
+        }
+        gesture.dx = dx
+        gesture.dy = dy
+        scheduleGesturePreview()
       }
 
       function releaseCapture(event) {
@@ -1468,8 +3448,11 @@
         const gesture = gestureRef.current
         if (!gesture || gesture.pointerId !== event.pointerId) return
         gestureRef.current = null
+        cancelGestureFrame()
         setGestureActive(false)
         releaseCapture(event)
+        setSnapGuides([])
+        setSnapGuidesArtboardId(null)
         if (!gesture.moved) return
         if (gesture.kind === 'reorder') {
           const index = computeReorderIndex(
@@ -1493,56 +3476,89 @@
           beacon('layer-reorder', { layerId: gesture.layerId, index: target, source: 'drag' })
           return
         }
-        const dx = screenDeltaToCanvas(
-          finiteNumber(event.clientX, gesture.clientX) - gesture.startX,
-          cameraRef.current.zoom,
-        )
-        const dy = screenDeltaToCanvas(
-          finiteNumber(event.clientY, gesture.clientY) - gesture.startY,
-          cameraRef.current.zoom,
-        )
-        const patch = gesturePatch(gesture, dx, dy)
-        if (!patch) return
-        let inversePatch
-        if (gesture.kind === 'resize-auto') {
-          inversePatch = { width: gesture.origin.width, height: gesture.origin.height }
-        } else if (gesture.kind === 'drag') {
-          inversePatch = { x: gesture.origin.x, y: gesture.origin.y }
-        } else {
-          inversePatch = {
-            x: gesture.origin.x,
-            y: gesture.origin.y,
-            width: gesture.origin.width,
-            height: gesture.origin.height,
-          }
+        const zoom = cameraRef.current.zoom > 0 ? cameraRef.current.zoom : 1
+        // Prefer the previewed (snapped) delta; fall back to the release coordinates.
+        let dx = typeof gesture.dx === 'number' ? gesture.dx : NaN
+        let dy = typeof gesture.dy === 'number' ? gesture.dy : NaN
+        if (!Number.isFinite(dx) || !Number.isFinite(dy)) {
+          dx = screenDeltaToCanvas(
+            finiteNumber(event.clientX, gesture.clientX) - gesture.startX,
+            zoom,
+          )
+          dy = screenDeltaToCanvas(
+            finiteNumber(event.clientY, gesture.clientY) - gesture.startY,
+            zoom,
+          )
+          gesture.dx = dx
+          gesture.dy = dy
         }
-        commitWithHistory(
-          'gesture',
-          [{ type: 'layer.update', layerId: gesture.layerId, patch: patch }],
-          [{ type: 'layer.update', layerId: gesture.layerId, patch: inversePatch }],
-        )
+        // Alt+drag duplicates the selection on drop and leaves the originals in place.
+        if (gesture.kind === 'drag' && event.altKey) {
+          applyAltDragDuplicate(gesture, dx, dy)
+          return
+        }
+        const entries = gesturePatchEntries(gesture)
+        if (!entries.length) return
+        const ops = []
+        const inverse = []
+        for (let index = 0; index < entries.length; index += 1) {
+          ops.push({ type: 'layer.update', layerId: entries[index].layerId, patch: entries[index].patch })
+        }
+        for (let index = 0; index < gesture.members.length; index += 1) {
+          const member = gesture.members[index]
+          const inversePatch =
+            gesture.kind === 'resize-auto'
+              ? { width: member.origin.width, height: member.origin.height }
+              : gesture.kind === 'drag'
+                ? { x: member.origin.x, y: member.origin.y }
+                : {
+                    x: member.origin.x,
+                    y: member.origin.y,
+                    width: member.origin.width,
+                    height: member.origin.height,
+                  }
+          inverse.push({ type: 'layer.update', layerId: member.layerId, patch: inversePatch })
+        }
+        // A pending animation frame may not have run yet; make the final state visible now.
+        const current = docRef.current
+        if (current) applyDocLocal(docPatchLayers(current, entries))
+        commitWithHistory('gesture', ops, inverse)
+        beacon('gesture', { kind: gesture.kind, count: ops.length })
       }
 
       function gestureCancel(event) {
         const gesture = gestureRef.current
         if (!gesture || gesture.pointerId !== event.pointerId) return
         gestureRef.current = null
+        cancelGestureFrame()
         setGestureActive(false)
+        setSnapGuides([])
+        setSnapGuidesArtboardId(null)
         releaseCapture(event)
         if (!gesture.moved) return
         // A cancelled reorder left the document untouched.
         if (gesture.kind === 'reorder') return
-        const restore =
-          gesture.kind === 'resize-auto'
-            ? { width: gesture.origin.width, height: gesture.origin.height }
-            : {
-                x: gesture.origin.x,
-                y: gesture.origin.y,
-                width: gesture.origin.width,
-                height: gesture.origin.height,
-              }
-        patchLocalLayer(gesture.layerId, restore)
-        runOps([{ type: 'layer.update', layerId: gesture.layerId, patch: restore }])
+        const current = docRef.current
+        if (!current) return
+        // The Host never saw the preview (it only existed locally), so restoring locally is
+        // enough: no runOps, no history entry.
+        const restore = gesture.members.map(function (member) {
+          return {
+            layerId: member.layerId,
+            patch:
+              gesture.kind === 'resize-auto'
+                ? { width: member.origin.width, height: member.origin.height }
+                : gesture.kind === 'drag'
+                  ? { x: member.origin.x, y: member.origin.y }
+                  : {
+                      x: member.origin.x,
+                      y: member.origin.y,
+                      width: member.origin.width,
+                      height: member.origin.height,
+                    },
+          }
+        })
+        if (restore.length) applyDocLocal(docPatchLayers(current, restore))
       }
 
       /* ------------------------------- pan: middle drag, space+drag, empty background ------------------------------- */
@@ -1798,6 +3814,55 @@
                 duplicateSelected()
                 return
               }
+              if (shortcut === 'a') {
+                event.preventDefault()
+                selectAllInArtboard()
+                return
+              }
+              if (shortcut === 'c') {
+                event.preventDefault()
+                copySelection()
+                return
+              }
+              if (shortcut === 'x') {
+                event.preventDefault()
+                cutSelection()
+                return
+              }
+              if (shortcut === 'v') {
+                event.preventDefault()
+                const pending = pasteSelection()
+                if (pending && typeof pending.catch === 'function') {
+                  pending.catch(function () {
+                    /* paste is best-effort; errors surface through inlineError */
+                  })
+                }
+                return
+              }
+              if (shortcut === 'g') {
+                event.preventDefault()
+                if (event.shiftKey) {
+                  ungroupSelection()
+                } else {
+                  const pending = groupSelection()
+                  if (pending && typeof pending.catch === 'function') {
+                    pending.catch(function () {
+                      /* group errors surface through inlineError */
+                    })
+                  }
+                }
+                return
+              }
+              if (event.key === ']' || event.key === '}') {
+                event.preventDefault()
+                arrangeSelection(event.shiftKey ? 'front' : 'forward')
+                return
+              }
+              if (event.key === '[' || event.key === '{') {
+                event.preventDefault()
+                arrangeSelection(event.shiftKey ? 'back' : 'backward')
+                return
+              }
             }
             if (
               event.key === 'ArrowLeft' ||
@@ -1834,12 +3899,29 @@
             if (event.key === 'Escape') {
               releaseSpace()
               cancelPan()
-              setComposer(null)
-              setSelectedLayerId(null)
+              if (cancelMarquee()) {
+                if (typeof event.preventDefault === 'function') event.preventDefault()
+                return
+              }
+              // The composer textarea handles its own Escape (and stops propagation).
+              if (composer) {
+                setComposer(null)
+                return
+              }
+              // Esc steps out of a drilled group to the group, else clears the selection.
+              stepSelectionOut()
+              return
+            }
+            if (event.key === 'Enter') {
+              // Never steal Enter from a focused control (buttons, links, inputs are filtered).
+              if (tag === 'BUTTON' || tag === 'A') return
+              if (drillIntoSelection()) {
+                if (typeof event.preventDefault === 'function') event.preventDefault()
+              }
               return
             }
             if (event.key === 'Delete' || event.key === 'Backspace') {
-              if (selectedLayerIdRef.current) {
+              if (selectedLayerIdsRef.current.length) {
                 event.preventDefault()
                 deleteSelectedLayer()
               }
@@ -2030,19 +4112,53 @@
           beacon('image-rejected', { source: source, reason: 'no-artboard' })
           return
         }
-        const layer = placeImageInArtboard(targetArtboard, localPoint, naturalWidth, naturalHeight)
-        layer.src = dataUrl
-        applyDocLocal(docInsertLayer(current, { artboardId: targetArtboard.id }, layer))
-        setSelectedLayerId(layer.id)
-        setSelectedArtboardId(targetArtboard.id)
-        commitWithHistory(
-          'image-add',
-          [{ type: 'layer.add', artboardId: targetArtboard.id, layer: layer }],
-          [{ type: 'layer.delete', layerId: layer.id }],
+        // Images dropped/pasted onto a group or frame land INSIDE that container; with no
+        // pointer position, a selected container is the target as well.
+        let dropContainer = null
+        if (localPoint) {
+          const drop = imageDropContainerAt(treeRef.current, targetArtboard.id, localPoint)
+          if (drop && drop.node && drop.node.depth < FRAME_MAX_DEPTH) {
+            if (childrenOf(drop.node.layer).length < FRAME_MAX_CHILDREN) dropContainer = drop
+          }
+        }
+        if (!dropContainer) {
+          const primaryId = selectedLayerIdRef.current
+          const primaryNode = primaryId ? nodeForLayer(primaryId) : null
+          if (
+            primaryNode &&
+            isContainerLayer(primaryNode.layer) &&
+            primaryNode.depth < FRAME_MAX_DEPTH &&
+            childrenOf(primaryNode.layer).length < FRAME_MAX_CHILDREN
+          ) {
+            dropContainer = {
+              node: primaryNode,
+              localPoint: { x: primaryNode.width / 2, y: primaryNode.height / 2 },
+            }
+          }
+        }
+        const containerBox = dropContainer ? dropContainer.node.layer : targetArtboard
+        const boxWidth = Math.max(1, finiteNumber(containerBox.width, targetArtboard.width))
+        const boxHeight = Math.max(1, finiteNumber(containerBox.height, targetArtboard.height))
+        const layer = placeImageInArtboard(
+          Object.assign({}, containerBox, { width: boxWidth, height: boxHeight }),
+          dropContainer ? dropContainer.localPoint : localPoint,
+          naturalWidth,
+          naturalHeight,
         )
+        layer.src = dataUrl
+        const destination = dropContainer
+          ? { parentId: dropContainer.node.layer.id }
+          : { artboardId: targetArtboard.id }
+        applyDocLocal(docInsertLayer(current, destination, layer))
+        applySelection([layer.id], targetArtboard.id, null)
+        const addOp = { type: 'layer.add', layer: layer }
+        if (destination.parentId) addOp.parentId = destination.parentId
+        else addOp.artboardId = destination.artboardId
+        commitWithHistory('image-add', [addOp], [{ type: 'layer.delete', layerId: layer.id }])
         beacon('image-add', {
           source: source,
           mode: 'add',
+          parentId: destination.parentId,
           bytes: finiteNumber(file && file.size, 0),
           width: layer.width,
           height: layer.height,
@@ -2225,6 +4341,21 @@
       const selectedNode =
         selectedLayerId && tree && tree.byId ? tree.byId.get(selectedLayerId) || null : null
 
+      // Computed nodes for every selected layer (ordered, primary last). The renderer draws one
+      // outline per node; the shell/inspector use it for multi-selection affordances.
+      const selectedNodes = React.useMemo(
+        function () {
+          if (!tree || !tree.byId || !selectedLayerIds.length) return []
+          const nodes = []
+          for (let index = 0; index < selectedLayerIds.length; index += 1) {
+            const node = tree.byId.get(selectedLayerIds[index])
+            if (node) nodes.push(node)
+          }
+          return nodes
+        },
+        [tree, selectedLayerIds],
+      )
+
       const commentIndex = React.useMemo(
         function () {
           const openCounts = new Map()
@@ -2351,20 +4482,55 @@
         camera: camera,
         strings: strings,
         selection: {
-          layerIds: selectedLayerId ? [selectedLayerId] : [],
+          layerIds: selectedLayerIds.slice(),
           primaryLayerId: selectedLayerId,
           artboardId: selectedArtboardId,
+          drillGroupId: drillGroupId,
         },
         selectedLayerId: selectedLayerId,
+        selectedLayerIds: selectedLayerIds.slice(),
         selectedArtboardId: selectedArtboardId,
+        selectedNode: selectedNode,
+        selectedNodes: selectedNodes,
+        drillGroupId: drillGroupId,
+        marquee: marquee,
+        snapGuides: snapGuides,
+        snapGuidesArtboardId: snapGuidesArtboardId,
+        snapEnabled: snapEnabled,
+        setSnapEnabled: setSnapEnabled,
+        toggleSnap: toggleSnap,
         selectLayer: selectLayer,
+        selectLayers: selectLayers,
+        selectAll: selectAllInArtboard,
         selectArtboard: selectArtboard,
         clearSelection: clearSelection,
+        stepSelectionOut: stepSelectionOut,
+        drillIntoSelection: drillIntoSelection,
+        drillIntoNode: drillIntoNode,
         commitLayer: commitLayer,
         commitArtboard: commitArtboard,
+        updateLayer: updateLayer,
+        renameLayer: renameLayer,
+        renameArtboard: renameArtboard,
+        reorderLayer: reorderLayer,
         addLayer: addLayer,
+        addButtonPreset: addButtonPreset,
         deleteSelected: deleteSelectedLayer,
         duplicateSelected: duplicateSelected,
+        groupSelection: groupSelection,
+        ungroupSelection: ungroupSelection,
+        alignSelection: alignSelection,
+        distributeSelection: distributeSelection,
+        tidySelection: tidySelection,
+        arrangeSelection: arrangeSelection,
+        reorderSelection: reorderSelection,
+        moveSelected: moveSelected,
+        reparentSelection: reparentSelection,
+        toggleLock: toggleLock,
+        copySelection: copySelection,
+        cutSelection: cutSelection,
+        pasteSelection: pasteSelection,
+        nudgeSelection: nudgeSelected,
         undo: undoOnce,
         redo: redoOnce,
         canUndo: function () {
@@ -2379,6 +4545,9 @@
         openComposerFor: openComposerFor,
         setCommentStatus: setCommentStatus,
         deleteComment: deleteCommentById,
+        submitComment: submitComment,
+        sendCommentChat: sendCommentChat,
+        submitComments: submitCommentsFor,
         zoom: camera ? camera.zoom : 1,
         fitCamera: fitCamera,
         zoomCameraBy: zoomCameraBy,
@@ -2404,8 +4573,18 @@
         setInlineError: setInlineError,
         selectedLayerId: selectedLayerId,
         setSelectedLayerId: setSelectedLayerId,
+        selectedLayerIds: selectedLayerIds,
+        setSelectedLayerIds: setSelectedLayerIds,
         selectedArtboardId: selectedArtboardId,
         setSelectedArtboardId: setSelectedArtboardId,
+        drillGroupId: drillGroupId,
+        setDrillGroupId: setDrillGroupId,
+        marquee: marquee,
+        snapGuides: snapGuides,
+        snapGuidesArtboardId: snapGuidesArtboardId,
+        snapEnabled: snapEnabled,
+        setSnapEnabled: setSnapEnabled,
+        toggleSnap: toggleSnap,
         camera: camera,
         setCamera: setCamera,
         panning: panning,
@@ -2479,6 +4658,10 @@
         openComposerFor: openComposerFor,
         commitLayer: commitLayer,
         commitArtboard: commitArtboard,
+        updateLayer: updateLayer,
+        renameLayer: renameLayer,
+        renameArtboard: renameArtboard,
+        reorderLayer: reorderLayer,
         toggleVisible: toggleVisible,
         deleteLayerById: deleteLayerById,
         deleteSelectedLayer: deleteSelectedLayer,
@@ -2500,6 +4683,8 @@
         deleteCommentById: deleteCommentById,
         sendCommentChat: sendCommentChat,
         submitComment: submitComment,
+        // v2 batch API: one chat message for many comments (helper lives in 53-batch.js).
+        submitComments: submitCommentsFor,
         gesturePatch: gesturePatch,
         beginGesture: beginGesture,
         layerPointerDown: layerPointerDown,
@@ -2532,6 +4717,61 @@
         canvasDrop: canvasDrop,
         tree: tree,
         selectedNode: selectedNode,
+        selectedNodes: selectedNodes,
+        // v2 selection / interaction surface (consumed by the shell, selection bar, renderer).
+        selectLayers: selectLayers,
+        selectAllInArtboard: selectAllInArtboard,
+        drillIntoSelection: drillIntoSelection,
+        drillIntoNode: drillIntoNode,
+        stepSelectionOut: stepSelectionOut,
+        toggleSnap: toggleSnap,
+        groupSelection: groupSelection,
+        ungroupSelection: ungroupSelection,
+        alignSelection: alignSelection,
+        distributeSelection: distributeSelection,
+        tidySelection: tidySelection,
+        arrangeSelection: arrangeSelection,
+        reorderSelection: reorderSelection,
+        reparentSelection: reparentSelection,
+        toggleLock: toggleLock,
+        copySelection: copySelection,
+        cutSelection: cutSelection,
+        pasteSelection: pasteSelection,
+        addButtonPreset: addButtonPreset,
+        rootSelectionIds: rootSelectionIds,
+        selectionBounds: selectionBounds,
+        selectionGroups: selectionGroups,
+        reorderOpsToReach: reorderOpsToReach,
+        marqueeSelectionIds: marqueeSelectionIds,
+        beginMarquee: beginMarquee,
+        cancelMarquee: cancelMarquee,
+        applySelection: applySelection,
+        nodeForLayer: nodeForLayer,
+        selectionTargetForNode: selectionTargetForNode,
+        gesturePatchEntries: gesturePatchEntries,
+        scheduleGesturePreview: scheduleGesturePreview,
+        flushGesturePreview: flushGesturePreview,
+        cancelGestureFrame: cancelGestureFrame,
+        gestureMembersFor: gestureMembersFor,
+        applyAltDragDuplicate: applyAltDragDuplicate,
+        writeClipboardText: writeClipboardText,
+        readClipboardText: readClipboardText,
+        parseClipboardPayload: parseClipboardPayload,
+        insertPastedLayers: insertPastedLayers,
+        pasteDestination: pasteDestination,
+        patchDiff: patchDiff,
+        siblingRangeIds: siblingRangeIds,
+        siblingNodesOf: siblingNodesOf,
+        selectionNodes: selectionNodes,
+        artboardIdForLayer: artboardIdForLayer,
+        clipboardRef: clipboardRef,
+        marqueeRef: marqueeRef,
+        gestureFrameRef: gestureFrameRef,
+        selectedLayerIdsRef: selectedLayerIdsRef,
+        drillGroupIdRef: drillGroupIdRef,
+        snapEnabledRef: snapEnabledRef,
+        lastLayerPointerRef: lastLayerPointerRef,
+        snapGuidesArtboardId: snapGuidesArtboardId,
         commentIndex: commentIndex,
         selectedComments: selectedComments,
         layout: layout,

@@ -1,12 +1,30 @@
+    /* ------------------------------------------------------------------------------------------
      * Layer defaults
      * ---------------------------------------------------------------------------------------- */
 
     const LAYER_TYPE_LABELS = {
+      // The value doubles as the Glyph name used by the layer tree and the inspector.
       rect: 'rect',
       ellipse: 'ellipse',
       text: 'text',
       image: 'image',
       frame: 'frame',
+      line: 'minus',
+      group: 'layers',
+    }
+
+    const BUTTON_PRESET = {
+      label: 'Button',
+      height: 44,
+      width: 136,
+      fontSize: 15,
+      lineHeight: 20,
+      fill: '#2563eb',
+      color: '#ffffff',
+      gap: 8,
+      paddingY: 12,
+      paddingX: 20,
+      radius: 10,
     }
 
     function layerTypeLabel(type) {
@@ -50,6 +68,23 @@
           height: frameHeight,
         }
       }
+      if (type === 'line') {
+        // A thin horizontal rule at ~40% height, wide enough to read at fit zoom.
+        return {
+          x: Math.round((width - 160) / 2),
+          y: Math.round(height * 0.4),
+          width: 160,
+          height: 2,
+        }
+      }
+      if (type === 'group') {
+        return {
+          x: Math.round((width - 240) / 2),
+          y: Math.round((height - 160) / 2),
+          width: 240,
+          height: 160,
+        }
+      }
       return {
         x: Math.round((width - 240) / 2),
         y: Math.round((height - 160) / 2),
@@ -77,7 +112,11 @@
                   ? 'Image'
                   : type === 'frame'
                     ? 'Frame'
-                    : 'Layer',
+                    : type === 'line'
+                      ? 'Line'
+                      : type === 'group'
+                        ? 'Group'
+                        : 'Layer',
         x: geometry.x,
         y: geometry.y,
         width: geometry.width,
@@ -105,6 +144,10 @@
         base.src = ''
         base.fit = 'cover'
         base.radius = 0
+      } else if (type === 'line') {
+        base.stroke = '#111827'
+        base.strokeWidth = 2
+        base.orientation = 'horizontal'
       } else if (type === 'frame') {
         base.fill = '#f3f4f6'
         base.radius = 8
@@ -113,8 +156,63 @@
         base.clip = false
         base.layout = null
         base.children = []
+      } else if (type === 'group') {
+        // Groups are normally created from a selection (`layer.group`); this only has to be a
+        // structurally valid container when a caller asks for one directly.
+        base.clip = false
+        base.children = []
       }
       return base
+    }
+
+    /**
+     * The two layers of the button preset: an auto-layout frame (row, gap 8, padding 12/20,
+     * radius 10, brand fill) with a centred white label. The editor turns these into two
+     * `layer.add` ops (a frame cannot be added with children in one op).
+     */
+    function createButtonPresetLayers(container) {
+      const box = isObject(container) ? container : {}
+      const width = Math.max(1, finiteNumber(box.width, 1200))
+      const height = Math.max(1, finiteNumber(box.height, 800))
+      const preset = BUTTON_PRESET
+      const frame = createLayer('frame', box)
+      frame.name = preset.label
+      frame.width = preset.width
+      frame.height = preset.height
+      frame.x = Math.round((width - preset.width) / 2)
+      frame.y = Math.round((height - preset.height) / 2)
+      frame.fill = preset.fill
+      frame.radius = preset.radius
+      frame.borderWidth = 0
+      frame.borderColor = preset.fill
+      frame.clip = false
+      frame.layout = {
+        direction: 'row',
+        gap: preset.gap,
+        padding: {
+          top: preset.paddingY,
+          right: preset.paddingX,
+          bottom: preset.paddingY,
+          left: preset.paddingX,
+        },
+        align: 'center',
+        justify: 'center',
+        wrap: false,
+      }
+      const label = createLayer('text', frame)
+      label.name = 'Button label'
+      label.text = preset.label
+      label.color = preset.color
+      label.fontSize = preset.fontSize
+      label.fontWeight = 600
+      label.fontFamily = DEFAULT_FONT
+      label.align = 'center'
+      label.lineHeight = preset.lineHeight
+      label.width = 56
+      label.height = preset.lineHeight
+      label.x = 0
+      label.y = 0
+      return { frame: frame, text: label }
     }
 
     function createArtboard(doc) {
@@ -132,3 +230,5 @@
     }
 
     /* ------------------------------------------------------------------------------------------
+     * Frames / layout helpers continue in 28-layout.js; this part owns layer defaults only.
+     * ---------------------------------------------------------------------------------------- */

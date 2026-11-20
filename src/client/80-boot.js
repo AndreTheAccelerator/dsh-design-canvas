@@ -127,6 +127,71 @@
     }
 
     /* ------------------------------------------------------------------------------------------
+     * Internal test surface
+     *
+     * The browser half is one module scope with no exports, so `tests/client.test.mjs` needs a
+     * deliberate handle to reach the pure helpers (layout math, doc helpers, code generators,
+     * comment message builder). This is internal and unsupported: nothing in the plugin reads
+     * it, and the public contract is the tab body + the Host API.
+     * ---------------------------------------------------------------------------------------- */
+
+    function testSurface() {
+      const surface = {
+        // document helpers
+        isObject: isObject,
+        finiteNumber: finiteNumber,
+        clamp: clamp,
+        roundTo: roundTo,
+        findLayerById: findLayerById,
+        docPatchLayer: docPatchLayer,
+        docInsertLayer: docInsertLayer,
+        docRemoveLayer: docRemoveLayer,
+        docMoveLayer: docMoveLayer,
+        docReorderLayer: docReorderLayer,
+        countLayers: countLayers,
+        // layout
+        computeLayout: computeLayout,
+        computeFrameChildBoxes: computeFrameChildBoxes,
+        buildComputedTree: buildComputedTree,
+        normalizeLayoutObject: normalizeLayoutObject,
+        layoutSummaryText: layoutSummaryText,
+        defaultLayoutObject: defaultLayoutObject,
+        // defaults
+        defaultGeometryFor: defaultGeometryFor,
+        createLayer: createLayer,
+        // camera
+        defaultCamera: defaultCamera,
+        normalizeCamera: normalizeCamera,
+        // comments
+        buildCommentMessage: buildCommentMessage,
+        // copy/locale
+        stringsFor: stringsFor,
+        currentLocaleId: currentLocaleId,
+        // extension registries
+        EXTENSIONS: EXTENSIONS,
+        registerToolbar: registerToolbar,
+        registerAppPanel: registerAppPanel,
+        registerInspectorSection: registerInspectorSection,
+        registerSelectionTool: registerSelectionTool,
+        registerKeyHandler: registerKeyHandler,
+        registerCommand: registerCommand,
+      }
+
+      // Code generators are contributed by the export part (43-export-code.js). `typeof` keeps
+      // this surface safe while that part is still a stub.
+      surface.renderHtml = typeof renderHtml === 'function' ? renderHtml : null
+      surface.renderReact = typeof renderReact === 'function' ? renderReact : null
+      surface.renderSvg = typeof renderSvg === 'function' ? renderSvg : null
+      surface.renderJson = typeof renderJson === 'function' ? renderJson : null
+      surface.renderPngDataUrl = typeof renderPngDataUrl === 'function' ? renderPngDataUrl : null
+      surface.exportOptions = typeof resolveExportOptions === 'function' ? resolveExportOptions : null
+      surface.renderExport = typeof renderExport === 'function' ? renderExport : null
+      surface.exportFileInfo = typeof exportFileInfo === 'function' ? exportFileInfo : null
+      surface.sanitizeFileName = typeof sanitizeFileName === 'function' ? sanitizeFileName : null
+      return surface
+    }
+
+    /* ------------------------------------------------------------------------------------------
      * Plugin definition
      * ---------------------------------------------------------------------------------------- */
 
@@ -134,6 +199,7 @@
       // Wait for the client services read below; otherwise apply() can run before
       // the sidebar/session/locale providers mount and every ctx.get() is undefined.
       inject: ['slots', 'sidebarRight', 'sidebarRightTabs', 'sessions', 'locale'],
+      __test: testSurface,
       apply(ctx) {
         beacon('apply-start')
         const tabs = ctx.get('sidebarRightTabs')
@@ -169,6 +235,10 @@
                   id: PLUGIN_ID,
                   kind: KIND,
                   title: function () {
+                    // The tab shows the design (project) name once a document has loaded, so
+                    // renaming the project renames the panel too.
+                    const designName = runtime.designName
+                    if (designName) return designName
                     return stringsFor(currentLocaleId()).pluginTitle
                   },
                   guide: [

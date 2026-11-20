@@ -74,6 +74,43 @@
       })
     }
 
+    /**
+     * Deepest group/frame under an artboard-local canvas point, so an image dropped on a group
+     * lands inside that group instead of on the artboard behind it. Returns
+     * `{ node, localPoint }` (localPoint relative to the container's top-left) or null.
+     */
+    function imageDropContainerAt(tree, artboardId, point) {
+      if (!tree || !Array.isArray(tree.artboards) || !isObject(point)) return null
+      const entry = tree.artboards.find(function (item) {
+        return item && item.artboard && item.artboard.id === artboardId
+      })
+      if (!entry) return null
+      function visit(nodes) {
+        const list = Array.isArray(nodes) ? nodes : []
+        // Front-to-back: later siblings paint on top, so visit the last child first.
+        for (let index = list.length - 1; index >= 0; index -= 1) {
+          const node = list[index]
+          if (!node || !node.layer) continue
+          const rect = node.worldRect
+          if (!rectContainsPoint(rect, point)) continue
+          if (!isContainerLayer(node.layer)) continue
+          // Frames and groups are containers: the innermost one under the pointer wins, so an
+          // image dropped over a group's children still lands in the group.
+          const deeper = visit(node.children)
+          if (deeper) return deeper
+          return {
+            node: node,
+            localPoint: {
+              x: finiteNumber(point.x, 0) - finiteNumber(rect.x, 0),
+              y: finiteNumber(point.y, 0) - finiteNumber(rect.y, 0),
+            },
+          }
+        }
+        return null
+      }
+      return visit(entry.layers)
+    }
+
     /* ------------------------------------------------------------------------------------------
      * Frames, CSS-like flex layout and the computed render tree
      *

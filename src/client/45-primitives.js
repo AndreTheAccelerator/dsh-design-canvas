@@ -7,34 +7,58 @@
      * ---------------------------------------------------------------------------------------- */
 
     function IconButton(props) {
+      const className =
+        'dc-ibtn' +
+        (props.active ? ' dc-active' : '') +
+        (props.className ? ' ' + props.className : '')
+      const attributes = {
+        type: 'button',
+        className: className,
+        title: props.title,
+        'aria-label': props.title,
+        'aria-pressed': props.active ? 'true' : undefined,
+        disabled: !!props.disabled,
+        onClick: props.onClick,
+        onPointerDown: props.onPointerDown,
+      }
+      if (props.menuToggle) attributes['data-dc-menu-toggle'] = ''
       return h(
         'button',
-        {
-          type: 'button',
-          className: 'dc-ibtn' + (props.active ? ' dc-active' : ''),
-          title: props.title,
-          'aria-label': props.title,
-          disabled: !!props.disabled,
-          onClick: props.onClick,
-          onPointerDown: props.onPointerDown,
-        },
+        attributes,
         props.children || h(Glyph, { name: props.icon, size: props.size || 14 }),
       )
     }
 
+    /** Join a tooltip and an optional shortcut hint: "Duplicate · Ctrl/Cmd+D". */
+    function tooltipText(base, hint) {
+      const label = String(base || '')
+      const extra = String(hint || '')
+      if (!extra) return label || undefined
+      return label ? label + ' · ' + extra : extra
+    }
+
     function ToolButton(props) {
+      const iconOnly = props.iconOnly === true || !props.label
+      const title = tooltipText(props.title || props.label || props.icon, props.hint)
+      const attributes = {
+        type: 'button',
+        className:
+          'dc-tool' +
+          (props.active ? ' dc-active' : '') +
+          (props.className ? ' ' + props.className : ''),
+        title: title,
+        'aria-label': props.title || props.label || props.icon,
+        'aria-pressed': props.active ? 'true' : undefined,
+        disabled: !!props.disabled,
+        onClick: props.onClick,
+      }
+      if (props.menuToggle) attributes['data-dc-menu-toggle'] = ''
       return h(
         'button',
-        {
-          type: 'button',
-          className: 'dc-tool' + (props.active ? ' dc-active' : ''),
-          title: props.title || props.label,
-          'aria-label': props.title || props.label,
-          disabled: !!props.disabled,
-          onClick: props.onClick,
-        },
-        props.icon ? h(Glyph, { name: props.icon, size: 12 }) : null,
-        props.label ? h('span', null, props.label) : null,
+        attributes,
+        props.icon ? h(Glyph, { name: props.icon, size: props.iconSize || 14 }) : null,
+        !iconOnly && props.label ? h('span', { className: 'dc-tool-label' }, props.label) : null,
+        props.caret ? h(Glyph, { name: 'chevronDown', size: 10, weight: 1.6 }) : null,
       )
     }
 
@@ -213,7 +237,7 @@
         props.label ? h('span', { className: 'dc-field-label' }, props.label) : null,
         h(
           'div',
-          { className: 'dc-seg' },
+          { className: 'dc-seg', role: 'group', 'aria-label': props.label },
           (props.options || []).map(function (option) {
             return h(
               'button',
@@ -221,6 +245,8 @@
                 key: option.value,
                 type: 'button',
                 title: option.title || option.label,
+                'aria-pressed': props.value === option.value ? 'true' : 'false',
+                disabled: Boolean(props.disabled),
                 className: 'dc-seg-btn' + (props.value === option.value ? ' dc-active' : ''),
                 onClick: function () {
                   if (props.value !== option.value) props.onCommit(option.value)
@@ -267,6 +293,7 @@
         h('input', {
           className: 'dc-swatch',
           type: 'color',
+          'aria-label': props.label,
           value: safeSwatchColor(props.value),
           disabled: !!props.disabled,
           onChange: function (event) {
@@ -301,6 +328,178 @@
     }
 
     /* ------------------------------------------------------------------------------------------
-     * Layer tree
+     * Popover menus + dialogs
      * ---------------------------------------------------------------------------------------- */
 
+    /**
+     * Anchored popover rendered by the shell inside `.dc-app`. Closes on outside pointerdown,
+     * Escape and scroll-away; anchors marked with `data-dc-menu-toggle` are ignored so a
+     * second click on the trigger toggles instead of reopening.
+     */
+    function MenuPanel(props) {
+      const nodeRef = React.useRef(null)
+      const onClose = props.onClose
+      React.useEffect(
+        function () {
+          function onPointerDown(event) {
+            const node = nodeRef.current
+            const target = event.target
+            if (node && target && typeof node.contains === 'function' && node.contains(target)) return
+            if (target && typeof target.closest === 'function' && target.closest('[data-dc-menu-toggle]')) {
+              return
+            }
+            onClose()
+          }
+          function onKeyDown(event) {
+            if (event.key !== 'Escape') return
+            event.stopPropagation()
+            if (typeof event.preventDefault === 'function') event.preventDefault()
+            onClose()
+          }
+          document.addEventListener('pointerdown', onPointerDown, true)
+          document.addEventListener('keydown', onKeyDown, true)
+          return function () {
+            document.removeEventListener('pointerdown', onPointerDown, true)
+            document.removeEventListener('keydown', onKeyDown, true)
+          }
+        },
+        [onClose],
+      )
+      return h(
+        'div',
+        { className: 'dc-menu-host' },
+        h('div', { className: 'dc-menu-scrim', 'aria-hidden': 'true' }),
+        h(
+          'div',
+          {
+            className: 'dc-menu',
+            role: 'menu',
+            'aria-label': props.label,
+            ref: nodeRef,
+            style: props.style,
+          },
+          props.children,
+        ),
+      )
+    }
+
+    function MenuLabel(props) {
+      return h('div', { className: 'dc-menu-label' }, props.children || props.label)
+    }
+
+    function MenuSeparator() {
+      return h('div', { className: 'dc-menu-sep', role: 'separator' })
+    }
+
+    function MenuItem(props) {
+      return h(
+        'button',
+        {
+          type: 'button',
+          role: 'menuitem',
+          className:
+            'dc-menu-item' +
+            (props.danger ? ' dc-danger' : '') +
+            (props.className ? ' ' + props.className : ''),
+          title: props.title || undefined,
+          disabled: !!props.disabled,
+          onClick: function (event) {
+            if (props.disabled) return
+            props.onSelect(event)
+          },
+        },
+        props.icon ? h('span', { className: 'dc-menu-item-icon' }, h(Glyph, { name: props.icon, size: 14 })) : null,
+        h('span', { className: 'dc-menu-item-label' }, props.label),
+        props.hint ? h('span', { className: 'dc-menu-item-hint' }, props.hint) : null,
+        props.checked ? h('span', { className: 'dc-menu-item-check' }, h(Glyph, { name: 'check', size: 12 })) : null,
+      )
+    }
+
+    /** Data-driven menu body: item objects in, menu rows out. */
+    function MenuList(props) {
+      const items = Array.isArray(props.items) ? props.items : []
+      return items.map(function (item, index) {
+        if (!item) return null
+        const key = item.id || 'menu-' + index
+        if (item.separator) return h(MenuSeparator, { key: key })
+        if (item.heading) return h(MenuLabel, { key: key, label: item.heading })
+        return h(MenuItem, {
+          key: key,
+          icon: item.icon,
+          label: item.label,
+          hint: item.hint,
+          checked: item.checked,
+          danger: item.danger,
+          disabled: item.disabled,
+          title: item.title,
+          onSelect: function (event) {
+            if (typeof item.onSelect === 'function') item.onSelect(event)
+            if (props.closeOnSelect !== false && typeof props.onClose === 'function') props.onClose()
+          },
+        })
+      })
+    }
+
+    /** Vertical panel splitter: pointer drag plus keyboard resize (arrow keys, Home resets). */
+    function Splitter(props) {
+      return h('div', {
+        className: 'dc-splitter' + (props.active ? ' dc-splitter-active' : ''),
+        role: 'separator',
+        'aria-orientation': 'vertical',
+        'aria-label': props.title,
+        'aria-valuenow': Math.round(props.value),
+        'aria-valuemin': props.min,
+        'aria-valuemax': props.max,
+        tabIndex: 0,
+        title: props.title,
+        onPointerDown: props.onPointerDown,
+        onPointerMove: props.onPointerMove,
+        onPointerUp: props.onPointerUp,
+        onPointerCancel: props.onPointerCancel,
+        onDoubleClick: props.onDoubleClick,
+        onKeyDown: props.onKeyDown,
+      })
+    }
+
+    function ModalDialog(props) {
+      const onClose = props.onClose
+      React.useEffect(
+        function () {
+          function onKeyDown(event) {
+            if (event.key !== 'Escape') return
+            event.stopPropagation()
+            if (typeof event.preventDefault === 'function') event.preventDefault()
+            onClose()
+          }
+          document.addEventListener('keydown', onKeyDown, true)
+          return function () {
+            document.removeEventListener('keydown', onKeyDown, true)
+          }
+        },
+        [onClose],
+      )
+      return h(
+        'div',
+        {
+          className: 'dc-modal-backdrop',
+          onPointerDown: function (event) {
+            if (event.target === event.currentTarget) onClose()
+          },
+        },
+        h(
+          'div',
+          { className: 'dc-modal', role: 'dialog', 'aria-modal': 'true', 'aria-label': props.title },
+          h(
+            'div',
+            { className: 'dc-modal-head' },
+            h('span', { className: 'dc-modal-title' }, props.title),
+            h(IconButton, { icon: 'close', title: props.closeLabel, onClick: onClose }),
+          ),
+          props.children,
+        ),
+      )
+    }
+
+    /* ------------------------------------------------------------------------------------------
+     * Layer tree
+     * ---------------------------------------------------------------------------------------- */
