@@ -16,8 +16,11 @@
     "flexbox"
   ],
   "scripts": {
+    "build": "node scripts/build-client.mjs",
+    "build:check": "node scripts/build-client.mjs --check",
+    "dev": "node dev/serve.mjs",
     "test": "node --test tests/model.test.mjs",
-    "check": "node --check index.js && node --check client.js && node --test tests/model.test.mjs"
+    "check": "npm run build:check && node --check index.js && node --check client.js && node --test tests/model.test.mjs"
   },
   "exports": {
     ".": "./index.js",

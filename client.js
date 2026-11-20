@@ -171,6 +171,69 @@ window.__ModuleLoader__.load({
     }
 
     /* ------------------------------------------------------------------------------------------
+     * Extension registries
+     *
+     * The browser half is authored as ordered parts in `src/client/` that share ONE module scope
+     * (see scripts/build-client.mjs). To keep two authors out of the same file, a feature part
+     * registers its UI/handlers here at factory load time and the shell renders the registry.
+     * Registration order follows the build manifest order, so the UI order is predictable.
+     *
+     * Entry shapes (all optional fields):
+     *   toolbar     { id, render(ctx) }                 ctx: { editor, strings }
+     *   appPanels   { id, render(ctx) }                 full-app overlays rendered last
+     *   inspector   { id, render(ctx) }                 ctx: { editor, layer, doc, strings, actions }
+     *   selection   { id, render(ctx) }                 selection bar tools (align, group, ...)
+     *   keys        { id, match(event, editor) => bool, run(event, editor) => bool }
+     *   commands    { id, label, run(editor) }          command-palette / menu entries
+     * ---------------------------------------------------------------------------------------- */
+
+    const EXTENSIONS = {
+      toolbar: [],
+      appPanels: [],
+      inspector: [],
+      selection: [],
+      keys: [],
+      commands: [],
+    }
+
+    function registerToolbar(entry) {
+      if (entry && typeof entry.render === 'function') EXTENSIONS.toolbar.push(entry)
+    }
+    function registerAppPanel(entry) {
+      if (entry && typeof entry.render === 'function') EXTENSIONS.appPanels.push(entry)
+    }
+    function registerInspectorSection(entry) {
+      if (entry && typeof entry.render === 'function') EXTENSIONS.inspector.push(entry)
+    }
+    function registerSelectionTool(entry) {
+      if (entry && typeof entry.render === 'function') EXTENSIONS.selection.push(entry)
+    }
+    function registerKeyHandler(entry) {
+      if (entry && typeof entry.match === 'function' && typeof entry.run === 'function') {
+        EXTENSIONS.keys.push(entry)
+      }
+    }
+    function registerCommand(entry) {
+      if (entry && typeof entry.run === 'function') EXTENSIONS.commands.push(entry)
+    }
+
+    /** Render a registry list, dropping entries that render nothing. */
+    function renderExtensions(list, ctx) {
+      if (!Array.isArray(list) || !list.length) return null
+      const out = []
+      for (let index = 0; index < list.length; index += 1) {
+        const entry = list[index]
+        try {
+          const rendered = entry.render(ctx)
+          if (rendered) out.push(h(React.Fragment, { key: String(entry.id || index) }, rendered))
+        } catch (error) {
+          beacon('extension-failed', { id: String(entry && entry.id), message: shortError(error) })
+        }
+      }
+      return out.length ? out : null
+    }
+
+    /* ------------------------------------------------------------------------------------------
      * Copy: small dictionary keyed by locale id, English fallback per key
      * ---------------------------------------------------------------------------------------- */
 
@@ -1838,6 +1901,28 @@ window.__ModuleLoader__.load({
 .dc-open-btn:focus-visible { outline: 2px solid var(--dsw-alias-brand-primary); outline-offset: 1px; }
 `
 
+    /* ------------------------------------------------------------------------------------------
+     * Export to code
+     *
+     * Pure functions that turn the document into source text: HTML + CSS, React (JSX), SVG and a
+     * standalone JSON snapshot, plus a raster fallback (SVG -> canvas -> PNG) that keeps the
+     * artboard vector-crisp at any scale. No DOM writes here: the dialog component in
+     * `44-export-ui.js` owns the UI, and the shell wires it through EXTENSIONS (00-core.js).
+     *
+     * Contract: every renderer takes (doc, options) and returns a string; unknown layer types
+     * degrade to a neutral box instead of throwing.
+     * ---------------------------------------------------------------------------------------- */
+    /* ------------------------------------------------------------------------------------------
+     * Export UI
+     *
+     * Registers the export entry points in the shell:
+     *   - toolbar button ("Export") through EXTENSIONS.toolbar
+     *   - the export dialog through EXTENSIONS.appPanels
+     *   - a keyboard shortcut (Ctrl/Cmd+Shift+E) through EXTENSIONS.keys
+     *
+     * A part may own CSS: keep a local `const EXPORT_CSS = \`...\`` here and render it with a
+     * <style> element inside the dialog, so the shared 42-css.js stays one author's file.
+     * ---------------------------------------------------------------------------------------- */
     function StyleTag() {
       return h('style', { dangerouslySetInnerHTML: { __html: CSS_TEXT } })
     }
@@ -2515,6 +2600,14 @@ window.__ModuleLoader__.load({
       )
     }
 
+    /* ------------------------------------------------------------------------------------------
+     * Comment workflow extras
+     *
+     * Batch selection of open comments ("send 3 comments to the agent in one message"), comment
+     * filters/search and the composer that turns several comments into a single revision
+     * request. Registers through EXTENSIONS (selection tools + app panels) where possible; the
+     * chat message itself is built by `buildCommentMessage` in 35-comment-msg.js.
+     * ---------------------------------------------------------------------------------------- */
     function Inspector(props) {
       const strings = props.strings
       const doc = props.doc
@@ -3243,6 +3336,29 @@ window.__ModuleLoader__.load({
         }),
       )
 
+      // Feature parts contribute inspector sections through EXTENSIONS.inspector
+      // (see 00-core.js): new layer props, export settings, layout helpers, …
+      if (EXTENSIONS.inspector.length) {
+        const extensionSections = renderExtensions(EXTENSIONS.inspector, props.extensionContext || {
+          doc: doc,
+          tree: tree,
+          strings: strings,
+          selection: {
+            layerIds: selectedLayerId ? [selectedLayerId] : [],
+            primaryLayerId: selectedLayerId,
+            artboardId: selectedArtboardId,
+          },
+          selectedLayerId: selectedLayerId,
+          selectedArtboardId: selectedArtboardId,
+          actions: actions,
+        })
+        if (extensionSections) {
+          for (let index = 0; index < extensionSections.length; index += 1) {
+            sections.push(extensionSections[index])
+          }
+        }
+      }
+
       return h(
         'aside',
         { className: 'dc-right', 'aria-label': strings.inspector },
@@ -3255,6 +3371,14 @@ window.__ModuleLoader__.load({
      * Canvas: artboards, layers, selection overlay, pins, inline composer
      * ---------------------------------------------------------------------------------------- */
 
+    /* ------------------------------------------------------------------------------------------
+     * Selection tools (multi-select UI)
+     *
+     * Marquee overlay, measurement readout while dragging, and the selection bar buttons
+     * (group / ungroup / align / distribute / arrange) registered through EXTENSIONS.selection.
+     * The selection state itself lives in `useEditor` (70-editor.js); these entries read it from
+     * the extension context and emit ops through `editor.actions`.
+     * ---------------------------------------------------------------------------------------- */
     const HANDLES = [
       { id: 'nw', fx: 0, fy: 0, cursor: 'nwse-resize' },
       { id: 'n', fx: 0.5, fy: 0, cursor: 'ns-resize' },
@@ -3636,8 +3760,14 @@ window.__ModuleLoader__.load({
      * Canvas root: state, sync, gestures, mutations
      * ---------------------------------------------------------------------------------------- */
 
-    function CanvasRoot(props) {
-      const sessionId = props.sessionId
+    /**
+     * Canvas editor state machine: document sync with the Host, selection, camera, history,
+     * gestures, mutations and comment flow. `CanvasRoot` (74-shell.js) renders it.
+     *
+     * Everything this hook returns is read by the shell; parts that only need one slice read
+     * that slice. Adding state means adding it here and destructuring it in the shell.
+     */
+    function useEditor(sessionId) {
       const strings = React.useMemo(function () {
         return stringsFor(currentLocaleId())
       }, [])
@@ -5394,6 +5524,24 @@ window.__ModuleLoader__.load({
             const target = event.target
             const tag = target ? String(target.tagName || '').toUpperCase() : ''
             if (editableTarget(target)) return
+            // Feature parts register shortcuts here (see EXTENSIONS.keys in 00-core.js);
+            // they run before the built-in bindings so a feature may claim an unused combo.
+            if (EXTENSIONS.keys.length) {
+              for (let index = 0; index < EXTENSIONS.keys.length; index += 1) {
+                const entry = EXTENSIONS.keys[index]
+                try {
+                  if (!entry.match(event)) continue
+                  if (entry.run(event, extensionApi) === false) continue
+                  event.preventDefault()
+                  return
+                } catch (error) {
+                  beacon('key-extension-failed', {
+                    id: String(entry && entry.id),
+                    message: shortError(error),
+                  })
+                }
+              }
+            }
             if ((event.ctrlKey || event.metaKey) && !event.altKey) {
               const shortcut = String(event.key || '').toLowerCase()
               if (shortcut === 'z') {
@@ -5955,7 +6103,325 @@ window.__ModuleLoader__.load({
         revising: strings.revising,
       }
 
+      /* ------------------------------- public API ------------------------------- */
+
+      // Curated action surface handed to feature parts (key handlers, app panels, panels that
+      // were registered through EXTENSIONS in 00-core.js). Everything here is stable API.
+      const extensionApi = {
+        doc: doc,
+        tree: tree,
+        camera: camera,
+        strings: strings,
+        selection: {
+          layerIds: selectedLayerId ? [selectedLayerId] : [],
+          primaryLayerId: selectedLayerId,
+          artboardId: selectedArtboardId,
+        },
+        selectedLayerId: selectedLayerId,
+        selectedArtboardId: selectedArtboardId,
+        selectLayer: selectLayer,
+        selectArtboard: selectArtboard,
+        clearSelection: clearSelection,
+        commitLayer: commitLayer,
+        commitArtboard: commitArtboard,
+        addLayer: addLayer,
+        deleteSelected: deleteSelectedLayer,
+        duplicateSelected: duplicateSelected,
+        undo: undoOnce,
+        redo: redoOnce,
+        canUndo: function () {
+          return historyRef.current.undo.length > 0
+        },
+        canRedo: function () {
+          return historyRef.current.redo.length > 0
+        },
+        setInlineError: setInlineError,
+        setInspectorOpen: setInspectorOpen,
+        setTreeOpen: setTreeOpen,
+        openComposerFor: openComposerFor,
+        setCommentStatus: setCommentStatus,
+        deleteComment: deleteCommentById,
+        zoom: camera ? camera.zoom : 1,
+        fitCamera: fitCamera,
+        zoomCameraBy: zoomCameraBy,
+        runOps: runOps,
+        applyDocLocal: applyDocLocal,
+      }
+
+      return {
+        strings: strings,
+        doc: doc,
+        setDoc: setDoc,
+        version: version,
+        setVersion: setVersion,
+        boardPath: boardPath,
+        setBoardPath: setBoardPath,
+        loading: loading,
+        setLoading: setLoading,
+        loadError: loadError,
+        setLoadError: setLoadError,
+        status: status,
+        setStatus: setStatus,
+        inlineError: inlineError,
+        setInlineError: setInlineError,
+        selectedLayerId: selectedLayerId,
+        setSelectedLayerId: setSelectedLayerId,
+        selectedArtboardId: selectedArtboardId,
+        setSelectedArtboardId: setSelectedArtboardId,
+        camera: camera,
+        setCamera: setCamera,
+        panning: panning,
+        setPanning: setPanning,
+        spaceHeld: spaceHeld,
+        setSpaceHeld: setSpaceHeld,
+        dragOver: dragOver,
+        setDragOver: setDragOver,
+        commentMode: commentMode,
+        setCommentMode: setCommentMode,
+        composer: composer,
+        setComposer: setComposer,
+        commentBusy: commentBusy,
+        setCommentBusy: setCommentBusy,
+        commentError: commentError,
+        setCommentError: setCommentError,
+        gestureActive: gestureActive,
+        setGestureActive: setGestureActive,
+        treeOpen: treeOpen,
+        setTreeOpen: setTreeOpen,
+        inspectorOpen: inspectorOpen,
+        setInspectorOpen: setInspectorOpen,
+        docRef: docRef,
+        versionRef: versionRef,
+        cameraRef: cameraRef,
+        panRef: panRef,
+        spaceHeldRef: spaceHeldRef,
+        imageInputRef: imageInputRef,
+        imagePickSourceRef: imagePickSourceRef,
+        selectedLayerIdRef: selectedLayerIdRef,
+        selectedArtboardIdRef: selectedArtboardIdRef,
+        gestureRef: gestureRef,
+        treeRef: treeRef,
+        inFlightRef: inFlightRef,
+        lastLocalVersionRef: lastLocalVersionRef,
+        statusTimerRef: statusTimerRef,
+        disposedRef: disposedRef,
+        mountReportedRef: mountReportedRef,
+        fitPendingRef: fitPendingRef,
+        canvasRef: canvasRef,
+        appRef: appRef,
+        canvasHoverRef: canvasHoverRef,
+        historyRef: historyRef,
+        applyingHistoryRef: applyingHistoryRef,
+        nudgeRef: nudgeRef,
+        applyDoc: applyDoc,
+        applyDocLocal: applyDocLocal,
+        patchLocalLayer: patchLocalLayer,
+        canvasViewport: canvasViewport,
+        screenToCanvas: screenToCanvas,
+        projectToViewport: projectToViewport,
+        setCameraValue: setCameraValue,
+        zoomAboutViewportPoint: zoomAboutViewportPoint,
+        zoomCameraBy: zoomCameraBy,
+        computeFitCamera: computeFitCamera,
+        fitCamera: fitCamera,
+        runOps: runOps,
+        retryNow: retryNow,
+        historyState: historyState,
+        pushHistoryEntry: pushHistoryEntry,
+        dropHistoryEntry: dropHistoryEntry,
+        commitWithHistory: commitWithHistory,
+        inversePatchFor: inversePatchFor,
+        insertOpsForSubtree: insertOpsForSubtree,
+        inverseMoveToOps: inverseMoveToOps,
+        undoOnce: undoOnce,
+        redoOnce: redoOnce,
+        selectLayer: selectLayer,
+        selectArtboard: selectArtboard,
+        clearSelection: clearSelection,
+        openComposerFor: openComposerFor,
+        commitLayer: commitLayer,
+        commitArtboard: commitArtboard,
+        toggleVisible: toggleVisible,
+        deleteLayerById: deleteLayerById,
+        deleteSelectedLayer: deleteSelectedLayer,
+        moveSelected: moveSelected,
+        opLayerForAdd: opLayerForAdd,
+        addLayer: addLayer,
+        cloneLayerSubtree: cloneLayerSubtree,
+        duplicateSelected: duplicateSelected,
+        nudgeSelected: nudgeSelected,
+        flushNudge: flushNudge,
+        commitShadow: commitShadow,
+        clearShadow: clearShadow,
+        reparentLayer: reparentLayer,
+        currentFrameForLayout: currentFrameForLayout,
+        setFrameAutoLayout: setFrameAutoLayout,
+        patchFrameLayout: patchFrameLayout,
+        addArtboard: addArtboard,
+        setCommentStatus: setCommentStatus,
+        deleteCommentById: deleteCommentById,
+        sendCommentChat: sendCommentChat,
+        submitComment: submitComment,
+        gesturePatch: gesturePatch,
+        beginGesture: beginGesture,
+        layerPointerDown: layerPointerDown,
+        handlePointerDown: handlePointerDown,
+        computeReorderIndex: computeReorderIndex,
+        artboardPointerDown: artboardPointerDown,
+        gestureMove: gestureMove,
+        releaseCapture: releaseCapture,
+        gestureUp: gestureUp,
+        gestureCancel: gestureCancel,
+        isMiddlePointer: isMiddlePointer,
+        beginPan: beginPan,
+        releasePanCapture: releasePanCapture,
+        canvasPointerDown: canvasPointerDown,
+        canvasPointerMove: canvasPointerMove,
+        endPan: endPan,
+        canvasPointerUp: canvasPointerUp,
+        canvasPointerCancel: canvasPointerCancel,
+        cancelPan: cancelPan,
+        holdSpace: holdSpace,
+        releaseSpace: releaseSpace,
+        openImagePicker: openImagePicker,
+        placeImageInArtboard: placeImageInArtboard,
+        replaceSelectedImage: replaceSelectedImage,
+        applyImageFile: applyImageFile,
+        handleImageFile: handleImageFile,
+        onImageInputChange: onImageInputChange,
+        canvasDragOver: canvasDragOver,
+        canvasDragLeave: canvasDragLeave,
+        canvasDrop: canvasDrop,
+        tree: tree,
+        selectedNode: selectedNode,
+        commentIndex: commentIndex,
+        selectedComments: selectedComments,
+        layout: layout,
+        composerPlacement: composerPlacement,
+        handlers: handlers,
+        statusLabels: statusLabels,
+      }
+    }
+    /**
+     * Canvas shell: header, toolbar, panels (tree / inspector / comments), splitter-friendly
+     * layout, the camera stage and the inline comment composer. All behaviour lives in
+     * `useEditor` (70-editor.js); this component only composes and positions UI.
+     */
+    function CanvasRoot(props) {
+      const editor = useEditor(props.sessionId)
+      const {
+        strings,
+        doc,
+        version,
+        boardPath,
+        loading,
+        loadError,
+        status,
+        inlineError,
+        setInlineError,
+        selectedLayerId,
+        selectedArtboardId,
+        camera,
+        panning,
+        spaceHeld,
+        dragOver,
+        commentMode,
+        setCommentMode,
+        composer,
+        setComposer,
+        commentBusy,
+        commentError,
+        gestureActive,
+        treeOpen,
+        setTreeOpen,
+        inspectorOpen,
+        setInspectorOpen,
+        imageInputRef,
+        selectedLayerIdRef,
+        canvasRef,
+        appRef,
+        canvasHoverRef,
+        zoomCameraBy,
+        fitCamera,
+        retryNow,
+        selectLayer,
+        selectArtboard,
+        clearSelection,
+        openComposerFor,
+        commitLayer,
+        commitArtboard,
+        toggleVisible,
+        deleteSelectedLayer,
+        moveSelected,
+        addLayer,
+        duplicateSelected,
+        commitShadow,
+        clearShadow,
+        reparentLayer,
+        setFrameAutoLayout,
+        patchFrameLayout,
+        addArtboard,
+        setCommentStatus,
+        deleteCommentById,
+        canvasPointerDown,
+        canvasPointerMove,
+        canvasPointerUp,
+        canvasPointerCancel,
+        openImagePicker,
+        onImageInputChange,
+        canvasDragOver,
+        canvasDragLeave,
+        canvasDrop,
+        tree,
+        selectedNode,
+        commentIndex,
+        selectedComments,
+        layout,
+        composerPlacement,
+        handlers,
+        statusLabels,
+      } = editor
+
       /* ------------------------------- early states ------------------------------- */
+
+      // Context handed to every extension registry entry (toolbar buttons, app panels,
+      // selection tools, inspector sections). Extensions live in their own parts.
+      const editorApi = {
+        editor: editor,
+        strings: strings,
+        doc: doc,
+        tree: tree,
+        layout: layout,
+        version: version,
+        boardPath: boardPath,
+        camera: camera,
+        zoom: camera.zoom,
+        selection: {
+          layerIds: selectedLayerId ? [selectedLayerId] : [],
+          primaryLayerId: selectedLayerId,
+          artboardId: selectedArtboardId,
+        },
+        selectedLayerId: selectedLayerId,
+        selectedArtboardId: selectedArtboardId,
+        selectedNode: selectedNode,
+        comments: selectedComments,
+        commentIndex: commentIndex,
+        actions: {
+          ...handlers,
+          commitLayer: commitLayer,
+          commitArtboard: commitArtboard,
+          addLayer: addLayer,
+          deleteSelected: deleteSelectedLayer,
+          duplicateSelected: duplicateSelected,
+          selectLayer: selectLayer,
+          selectArtboard: selectArtboard,
+          clearSelection: clearSelection,
+          setInlineError: setInlineError,
+          setCommentStatus: setCommentStatus,
+          deleteComment: deleteCommentById,
+          openComposerFor: openComposerFor,
+        },
+      }
 
       if (!doc) {
         return h(
@@ -6148,6 +6614,8 @@ window.__ModuleLoader__.load({
                 duplicateSelected()
               },
             }),
+            // Feature parts add their own tool buttons here (line, button preset, export, …).
+            renderExtensions(EXTENSIONS.toolbar, editorApi),
           ),
           h('span', { className: 'dc-spacer' }),
           h(
@@ -6171,6 +6639,14 @@ window.__ModuleLoader__.load({
             }),
           ),
         ),
+        // Selection tools (align/distribute/group/…) appear while something is selected.
+        EXTENSIONS.selection.length && (selectedLayerId || selectedArtboardId)
+          ? h(
+              'div',
+              { className: 'dc-selection-bar', key: 'selection-bar' },
+              renderExtensions(EXTENSIONS.selection, editorApi),
+            )
+          : null,
         h(
           'div',
           { className: 'dc-body' },
@@ -6343,6 +6819,7 @@ window.__ModuleLoader__.load({
                 selectedLayerId: selectedLayerId,
                 selectedArtboardId: selectedArtboardId,
                 comments: selectedComments,
+                extensionContext: editorApi,
                 actions: {
                   commitLayer: commitLayer,
                   commitArtboard: commitArtboard,
@@ -6377,6 +6854,8 @@ window.__ModuleLoader__.load({
               })
             : null,
         ),
+        // Full-app overlays registered by feature parts (export dialog, shortcuts sheet, …).
+        renderExtensions(EXTENSIONS.appPanels, editorApi),
       )
     }
 
