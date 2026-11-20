@@ -1,0 +1,571 @@
+/*
+ * Design canvas — dev harness styling.
+ *
+ * Two jobs:
+ *   1. Supply the `--dsw-alias-*` theme tokens the plugin's own CSS consumes. The plugin ships
+ *      only `var(--dsw-alias-*)` references, so the surrounding page owns their values.
+ *   2. Style the harness chrome (sidebar, panel frame, event console) with its own `--h-*`
+ *      variables so harness chrome never depends on the tokens under test.
+ *
+ * The token values below are NOT invented: they were extracted from the running installation's
+ * theme sheet inside
+ *   C:\Users\1\AppData\Local\Programs\DeepSeek Harness\resources\app.asar\dsh\
+ * Specifically the `body { ... }` (light) and `body[data-ds-dark-theme] { ... }` (dark) blocks,
+ * with `var(--dsw-static-*)` references resolved to their final colours. Only the 13 tokens the
+ * plugin actually references are listed; `grep -o 'var(--[a-z-]*' client.js | sort -u` returns
+ * exactly this set.
+ *
+ * Note on --dsw-alias-brand-primary: in the shipped DSH themes it is monochrome (#0f1115 on
+ * light, #f9fafb on dark), not blue. The blue accent in the product lives in a different token
+ * (`--dsw-alias-brand-primary-new-colorprimary-new-color` = #4176e6) that this plugin does not
+ * read. Keeping the real value is the point of a preview harness: the canvas truly looks
+ * monochrome-accented in the app.
+ */
+
+/* ------------------------------------------------------------------------------------------------
+ * Theme tokens — real DSH values (light)
+ * ---------------------------------------------------------------------------------------------- */
+
+[data-theme='light'] {
+  --dsw-alias-bg-base: #ffffff;
+  --dsw-alias-bg-layer-1: #ffffff;
+  --dsw-alias-bg-layer-2: #ffffff;
+  --dsw-alias-bg-overlay: #e9ecf2;
+  --dsw-alias-border-l1: #0000000a;
+  --dsw-alias-border-l2: #0000001a;
+  --dsw-alias-brand-primary: #0f1115;
+  --dsw-alias-label-primary: #0f1115;
+  --dsw-alias-label-secondary: #61666b;
+  --dsw-alias-state-error-primary: #ec1313;
+  --dsw-alias-state-idle-primary: #d4d4d4;
+  --dsw-alias-state-success-primary: #22c55e;
+  --dsw-alias-state-warn-primary: #f59e0b;
+}
+
+/* Theme tokens — real DSH values (dark) */
+[data-theme='dark'] {
+  --dsw-alias-bg-base: #151517;
+  --dsw-alias-bg-layer-1: #232324;
+  --dsw-alias-bg-layer-2: #2c2c2e;
+  --dsw-alias-bg-overlay: #61666b;
+  --dsw-alias-border-l1: #ffffff0f;
+  --dsw-alias-border-l2: #ffffff1f;
+  --dsw-alias-brand-primary: #f9fafb;
+  --dsw-alias-label-primary: #f9fafb;
+  --dsw-alias-label-secondary: #cfd3d6;
+  --dsw-alias-state-error-primary: #f25a5a;
+  --dsw-alias-state-idle-primary: #545557;
+  --dsw-alias-state-success-primary: #22c55e;
+  --dsw-alias-state-warn-primary: #f59e0b;
+}
+
+/* ------------------------------------------------------------------------------------------------
+ * Harness chrome palette (independent of the tokens above)
+ * ---------------------------------------------------------------------------------------------- */
+
+:root {
+  --h-page: #f4f5f7;
+  --h-surface: #ffffff;
+  --h-surface-2: #f0f2f5;
+  --h-border: #dfe3e8;
+  --h-ink: #16181d;
+  --h-ink-2: #5b6472;
+  --h-ink-3: #8a929e;
+  --h-accent: #4176e6;
+  --h-danger: #d4342b;
+  --h-warn: #b26b00;
+  --h-ok: #1f9254;
+  --h-radius: 8px;
+  --h-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace;
+  --h-ui: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+}
+
+[data-theme='dark'] {
+  --h-page: #101012;
+  --h-surface: #1a1a1c;
+  --h-surface-2: #232326;
+  --h-border: #303035;
+  --h-ink: #f2f3f5;
+  --h-ink-2: #b6bcc6;
+  --h-ink-3: #868d99;
+  --h-accent: #6f9bf0;
+  --h-danger: #f2685e;
+  --h-warn: #e0a33a;
+  --h-ok: #3bbd7c;
+}
+
+/* ------------------------------------------------------------------------------------------------
+ * Layout
+ * ---------------------------------------------------------------------------------------------- */
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: var(--h-ui);
+  font-size: 13px;
+  color: var(--h-ink);
+  background: var(--h-page);
+}
+
+.h-app {
+  display: grid;
+  grid-template-columns: 304px minmax(0, 1fr);
+  /* dvh, not vh: the harness is a full-window dev surface and must not be cut off by chrome. */
+  height: 100dvh;
+  min-height: 0;
+}
+
+/* ---------------------------------- sidebar ---------------------------------- */
+
+.h-side {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--h-surface);
+  border-right: 1px solid var(--h-border);
+}
+
+.h-side-head {
+  flex: 0 0 auto;
+  padding: 14px 16px 12px;
+  border-bottom: 1px solid var(--h-border);
+}
+
+.h-title {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  margin: 0;
+  font-size: 14px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
+.h-title span {
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--h-ink-3);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.h-subtitle {
+  margin: 4px 0 0;
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--h-ink-2);
+}
+
+.h-side-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 12px 16px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.h-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.h-label {
+  font-size: 10px;
+  font-weight: 650;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--h-ink-3);
+}
+
+.h-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.h-control {
+  width: 100%;
+  height: 28px;
+  padding: 0 8px;
+  font: inherit;
+  font-size: 12px;
+  color: var(--h-ink);
+  background: var(--h-surface-2);
+  border: 1px solid var(--h-border);
+  border-radius: 6px;
+}
+
+.h-control:focus-visible {
+  outline: 2px solid var(--h-accent);
+  outline-offset: 1px;
+}
+
+select.h-control {
+  cursor: pointer;
+}
+
+.h-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  height: 28px;
+  padding: 0 10px;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--h-ink);
+  background: var(--h-surface-2);
+  border: 1px solid var(--h-border);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.h-btn:focus-visible {
+  outline: 2px solid var(--h-accent);
+  outline-offset: 1px;
+}
+
+.h-btn-primary {
+  color: #ffffff;
+  background: var(--h-accent);
+  border-color: transparent;
+}
+
+/* Hover styling is for pointers that actually hover; touch taps keep the resting style. */
+@media (hover: hover) and (pointer: fine) {
+  .h-btn:hover {
+    border-color: var(--h-ink-3);
+  }
+
+  .h-btn-primary:hover {
+    filter: brightness(1.06);
+    border-color: transparent;
+  }
+
+  .h-linkbtn:hover {
+    text-decoration: underline;
+  }
+}
+
+.h-range {
+  width: 100%;
+  accent-color: var(--h-accent);
+}
+
+.h-seg {
+  display: flex;
+  width: 100%;
+  padding: 2px;
+  gap: 2px;
+  background: var(--h-surface-2);
+  border: 1px solid var(--h-border);
+  border-radius: 6px;
+}
+
+.h-seg button {
+  flex: 1 1 0;
+  height: 24px;
+  font: inherit;
+  font-size: 12px;
+  color: var(--h-ink-2);
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.h-seg button[aria-pressed='true'] {
+  color: var(--h-ink);
+  background: var(--h-surface);
+  box-shadow: 0 1px 2px rgb(0 0 0 / 0.12);
+}
+
+/* ---------------------------------- facts table ---------------------------------- */
+
+.h-facts {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 3px 10px;
+  font-size: 11.5px;
+}
+
+.h-facts dt {
+  color: var(--h-ink-2);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.h-facts dd {
+  margin: 0;
+  font-family: var(--h-mono);
+  font-size: 11px;
+  color: var(--h-ink);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.h-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 7px;
+  font-size: 10.5px;
+  font-weight: 600;
+  border-radius: 999px;
+  color: var(--h-ink-2);
+  background: var(--h-surface-2);
+  border: 1px solid var(--h-border);
+}
+
+.h-pill::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--h-ink-3);
+}
+
+.h-pill[data-state='ok']::before {
+  background: var(--h-ok);
+}
+
+.h-pill[data-state='busy']::before {
+  background: var(--h-warn);
+}
+
+.h-pill[data-state='bad']::before {
+  background: var(--h-danger);
+}
+
+/* ---------------------------------- event console ---------------------------------- */
+
+.h-console {
+  display: flex;
+  flex-direction: column;
+  flex: 0 1 236px;
+  min-height: 132px;
+  border-top: 1px solid var(--h-border);
+}
+
+.h-console-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 16px;
+  flex: 0 0 auto;
+}
+
+.h-console-head .h-label {
+  margin: 0;
+}
+
+.h-linkbtn {
+  padding: 0;
+  font: inherit;
+  font-size: 11px;
+  color: var(--h-accent);
+  background: none;
+  border: none;
+  cursor: pointer;
+}
+
+.h-log {
+  flex: 1 1 auto;
+  min-height: 0;
+  margin: 0;
+  padding: 0 10px 12px;
+  overflow-y: auto;
+  font-family: var(--h-mono);
+  font-size: 10.5px;
+  line-height: 1.5;
+  list-style: none;
+}
+
+.h-log li {
+  display: grid;
+  grid-template-columns: 52px 1fr;
+  gap: 6px;
+  padding: 1px 0;
+  color: var(--h-ink-2);
+  overflow-wrap: anywhere;
+}
+
+.h-log time {
+  color: var(--h-ink-3);
+  font-variant-numeric: tabular-nums;
+}
+
+.h-log li[data-kind='error'] {
+  color: var(--h-danger);
+}
+
+.h-log li[data-kind='warn'] {
+  color: var(--h-warn);
+}
+
+.h-log li[data-kind='beacon'] {
+  color: var(--h-accent);
+}
+
+.h-log li[data-kind='api'] {
+  color: var(--h-ink);
+}
+
+.h-log li[data-kind='prompt'] {
+  color: var(--h-ok);
+}
+
+.h-log-empty {
+  padding: 0 16px 12px;
+  font-size: 11.5px;
+  color: var(--h-ink-3);
+}
+
+/* ------------------------------------------------------------------------------------------------
+ * Interim shims for in-flight client work
+ * ---------------------------------------------------------------------------------------------- */
+
+/*
+ * Interim shim (2026-11-20): while the shell/canvas rewrite switches `.dc-stage` from
+ * `transform: scale()` to CSS `zoom`, the stage needs its transform origin at 0 0 — otherwise
+ * `translate(x,y) scale(z)` displaces the whole stage by `originX * (1 - z)` and every artboard
+ * renders outside the panel. `src/client/42-css.js` currently ships the stage rule without
+ * `transform-origin: 0 0`, and this harness must not edit production files to work around it.
+ *
+ * It is a no-op once the stage uses `zoom` (no transform to anchor), so it can stay until the
+ * chrome agent lands that, then be deleted. `!important` is required because the plugin's own
+ * stylesheet is injected after this one.
+ */
+.dc-stage {
+  transform-origin: 0 0 !important;
+}
+
+/* ---------------------------------- stage ---------------------------------- */
+
+.h-stage {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  background:
+    linear-gradient(0deg, rgb(0 0 0 / 0.02), rgb(0 0 0 / 0.02)),
+    var(--h-page);
+}
+
+.h-stage-bar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 16px;
+  font-size: 11.5px;
+  color: var(--h-ink-2);
+  border-bottom: 1px solid var(--h-border);
+  background: var(--h-surface);
+}
+
+.h-stage-bar strong {
+  color: var(--h-ink);
+  font-weight: 600;
+}
+
+.h-stage-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding: 20px;
+}
+
+/* The panel mimics the DSH right sidebar: a sized box the plugin body fills. */
+.h-panel-shell {
+  display: flex;
+  flex-direction: column;
+  width: fit-content;
+  min-width: 0;
+}
+
+.h-panel-caption {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 0 2px 6px;
+  font-size: 11px;
+  color: var(--h-ink-2);
+}
+
+.h-panel-caption code {
+  font-family: var(--h-mono);
+  font-size: 10.5px;
+  color: var(--h-ink-3);
+}
+
+.h-panel {
+  position: relative;
+  height: 900px;
+  width: 460px;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--dsw-alias-bg-base);
+  border: 1px solid var(--h-border);
+  border-radius: 10px;
+  box-shadow:
+    0 1px 2px rgb(16 18 22 / 0.06),
+    0 12px 32px rgb(16 18 22 / 0.08);
+  /* Load-bearing: the plugin's `.dc-app` is `height: 100%`, so the host box must be sized. */
+}
+
+.h-overlay {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: var(--h-page);
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--h-ink-2);
+  text-align: center;
+}
+
+.h-overlay[hidden] {
+  display: none;
+}
+
+.h-overlay pre {
+  max-width: 520px;
+  margin: 8px 0 0;
+  padding: 10px 12px;
+  font-family: var(--h-mono);
+  font-size: 11px;
+  text-align: left;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--h-danger);
+  background: var(--h-surface);
+  border: 1px solid var(--h-border);
+  border-radius: var(--h-radius);
+}
+
+.h-overlay strong {
+  display: block;
+  margin-bottom: 4px;
+  font-size: 13px;
+  color: var(--h-ink);
+}

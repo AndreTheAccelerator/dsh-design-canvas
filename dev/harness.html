@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Design canvas — dev harness</title>
+    <link rel="stylesheet" href="/harness.css" />
+  </head>
+  <body>
+    <div class="h-app">
+      <aside class="h-side">
+        <div class="h-side-head">
+          <h1 class="h-title">Design canvas <span>dev harness</span></h1>
+          <p class="h-subtitle">
+            The real <code>src/client</code> bundle against an in-memory mock Host. This is a local
+            dev tool, not the DSH app.
+          </p>
+        </div>
+
+        <div class="h-side-body">
+          <div class="h-group">
+            <label class="h-label" for="scenario">Scenario</label>
+            <select id="scenario" class="h-control" data-testid="scenario"></select>
+            <div class="h-row">
+              <button id="remount" class="h-btn" type="button" data-testid="remount">Remount</button>
+              <button id="reset" class="h-btn" type="button" data-testid="reset">Reset doc</button>
+            </div>
+          </div>
+
+          <div class="h-group">
+            <label class="h-label" for="width">
+              Panel width <output id="width-out" for="width">460</output>px
+            </label>
+            <input
+              id="width"
+              class="h-range"
+              type="range"
+              min="360"
+              max="1000"
+              step="10"
+              value="460"
+              data-testid="width"
+            />
+          </div>
+
+          <div class="h-group">
+            <span class="h-label">Theme</span>
+            <div class="h-seg" id="theme" role="group" aria-label="Theme">
+              <button type="button" data-theme-value="light" aria-pressed="true">Light</button>
+              <button type="button" data-theme-value="dark" aria-pressed="false">Dark</button>
+            </div>
+          </div>
+
+          <div class="h-group">
+            <span class="h-label">Bundle</span>
+            <div class="h-row">
+              <button id="reload" class="h-btn h-btn-primary" type="button" data-testid="reload">
+                Reload bundle
+              </button>
+              <span id="bundle-pill" class="h-pill" data-state="busy">loading</span>
+            </div>
+          </div>
+
+          <div class="h-group">
+            <span class="h-label">Facts</span>
+            <dl class="h-facts">
+              <dt>plugin slots</dt>
+              <dd id="fact-slots">—</dd>
+              <dt>react</dt>
+              <dd id="fact-react">—</dd>
+              <dt>bundle parts</dt>
+              <dd id="fact-parts">—</dd>
+              <dt>doc version</dt>
+              <dd id="fact-version">—</dd>
+              <dt>artboards / layers</dt>
+              <dd id="fact-counts">—</dd>
+              <dt>comments</dt>
+              <dd id="fact-comments">—</dd>
+              <dt>ops applied</dt>
+              <dd id="fact-ops">0</dd>
+              <dt>chat prompts</dt>
+              <dd id="fact-prompts">0</dd>
+              <dt>errors</dt>
+              <dd id="fact-errors">0</dd>
+            </dl>
+          </div>
+        </div>
+
+        <section class="h-console" aria-label="Harness events">
+          <div class="h-console-head">
+            <h2 class="h-label">Events</h2>
+            <button id="clear-log" class="h-linkbtn" type="button">clear</button>
+          </div>
+          <p class="h-log-empty" id="log-empty">No events yet.</p>
+          <ol class="h-log" id="log" data-testid="log"></ol>
+        </section>
+      </aside>
+
+      <main class="h-stage">
+        <div class="h-stage-bar">
+          <strong id="board-name">—</strong>
+          <span id="board-meta">waiting for the document</span>
+          <span class="h-pill" id="status-pill" data-state="idle">booting</span>
+        </div>
+
+        <div class="h-stage-scroll">
+          <div class="h-panel-shell">
+            <div class="h-panel-caption">
+              sidebar.right.pane.tab
+              <code>props: { sessionId: 'dev-session' }</code>
+            </div>
+            <div id="panel" class="h-panel" data-testid="panel"></div>
+          </div>
+        </div>
+
+        <div class="h-overlay" id="overlay" hidden>
+          <div>
+            <strong id="overlay-title">Harness error</strong>
+            <div id="overlay-text"></div>
+            <pre id="overlay-detail"></pre>
+          </div>
+        </div>
+      </main>
+    </div>
+
+    <script type="module" src="/harness.js"></script>
+  </body>
+</html>
