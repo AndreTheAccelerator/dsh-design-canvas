@@ -410,3 +410,60 @@ test('svg text wraps with measured advances when a measurer is available', () =>
   // Without a measurer the renderer must not throw (pure Node / SSR path).
   assert.doesNotThrow(() => t.renderSvg(doc, {}))
 })
+
+// Font stacks contain quotes, and a raw quote inside style="..." ends the attribute early: the
+// browser then silently drops every declaration after it (text-align, line-height, white-space).
+// That is why exported buttons had their labels pushed to the left.
+test('html export escapes quotes so declarations after the font stack survive', () => {
+  const doc = {
+    schemaVersion: 1,
+    name: 'Quotes',
+    version: 1,
+    updatedAt: '2026-01-01T00:00:00.000Z',
+    artboards: [
+      {
+        id: 'ab-1',
+        name: 'Board',
+        x: 0,
+        y: 0,
+        width: 400,
+        height: 200,
+        background: '#ffffff',
+        layers: [
+          {
+            id: 'l-btn',
+            type: 'frame',
+            name: 'Button',
+            x: 0,
+            y: 0,
+            width: 120,
+            height: 40,
+            fill: '#2563eb',
+            radius: 20,
+            layout: { direction: 'row', gap: 0, padding: { top: 10, right: 20, bottom: 10, left: 20 }, align: 'center', justify: 'center' },
+            children: [
+              { id: 'l-label', type: 'text', name: 'Label', x: 0, y: 0, width: 80, height: 20, text: 'Go now', fontSize: 14, align: 'center', lineHeight: 20 },
+            ],
+          },
+        ],
+      },
+    ],
+    comments: [],
+  }
+
+  const html = t.renderHtml(doc, {})
+  // The label's style attribute must be parseable as a whole: no raw quote may appear inside it.
+  const styleAttrs = [...html.matchAll(/style="([^"]*)"/g)].map((match) => match[1])
+  assert.ok(styleAttrs.length > 0, 'the export emits style attributes')
+
+  const labelStyle = styleAttrs.find((value) => value.includes('font-family'))
+  assert.ok(labelStyle, 'a text layer emits a font-family')
+  assert.ok(labelStyle.includes('&quot;'), 'quotes in the font stack are escaped: ' + labelStyle)
+  assert.ok(!labelStyle.includes('"'), 'no raw quote ends the attribute early')
+  assert.ok(labelStyle.includes('text-align:center'), 'alignment survives the escaped font stack')
+  assert.ok(labelStyle.includes('white-space:pre-wrap'), 'white-space survives too')
+  assert.ok(/line-height:\d/.test(labelStyle), 'line-height survives too')
+
+  // And the page must not contain a truncated copy of that declaration list.
+  assert.ok(!html.includes('font-family:system-ui, -apple-system, "Segoe UI"'), 'the raw stack is never emitted')
+})

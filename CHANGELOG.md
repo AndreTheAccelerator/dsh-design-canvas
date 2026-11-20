@@ -1,5 +1,17 @@
 ﻿# Changelog
 
+## 2.1.2 — 2026-11-20
+
+* **Text alignment was dropped from every exported text layer.** `font-family` contains quotes
+  (`"Segoe UI"`) and the HTML writer put it inside `style="..."` unescaped, so the browser ended the
+  attribute at that quote and silently discarded every declaration after it — `text-align`,
+  `line-height` and `white-space` all vanished. Centered button labels and the CTA heading then
+  rendered left-aligned (a button "with too much space on the right"), and authored newlines were
+  collapsed. Style attribute values are now HTML-escaped (`cssAttribute`); the `<style>` element
+  intentionally keeps raw CSS, where entities would not be decoded.
+  Test: a label whose font stack contains quotes still carries `text-align`, `white-space` and
+  `line-height`.
+
 ## 2.1.1 — 2026-11-20
 
 Export fidelity fixes found by exporting the Northwind mockup. All three were in the browser half

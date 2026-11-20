@@ -183,6 +183,16 @@
         .join('')
     }
 
+    /**
+     * CSS text safe to sit inside a double-quoted HTML attribute. Font stacks contain quotes
+     * (`"Segoe UI"`), and a raw quote ends the attribute early: the browser then drops every
+     * declaration that follows it — which silently lost `text-align`, `line-height` and
+     * `white-space` from every exported text layer.
+     */
+    function cssAttribute(style) {
+      return escapeHtml(cssDeclaration(style))
+    }
+
     /** camelCase style object -> JSX style literal body. */
     function jsxStyle(style) {
       const parts = Object.keys(style)
@@ -255,7 +265,7 @@
           exportTextStyle(layer),
         )
         const content = escapeHtml(layer.text || '')
-        return line('<div style="' + cssDeclaration(style) + '">' + content + '</div>')
+        return line('<div style="' + cssAttribute(style) + '">' + content + '</div>')
       }
 
       if (layer.type === 'image') {
@@ -272,19 +282,19 @@
         if (!src) {
           return line(
             '<div style="' +
-              cssDeclaration(Object.assign({}, style, { background: '#f3f4f6' })) +
+              cssAttribute(Object.assign({}, style, { background: '#f3f4f6' })) +
               '"></div>',
           )
         }
         return line(
           '<div style="' +
-            cssDeclaration(style) +
+            cssAttribute(style) +
             '"><img src="' +
             escapeHtml(src) +
             '" alt="' +
             escapeHtml(layer.name || 'image') +
             '" style="' +
-            cssDeclaration(imgStyle) +
+            cssAttribute(imgStyle) +
             '" /></div>',
         )
       }
@@ -292,7 +302,7 @@
       if (layer.type === 'line') {
         const style = Object.assign(exportSizeStyle(layer, computed, inFlex), { overflow: 'visible' })
         const svg = renderLineSvg(layer, computed, true)
-        return line('<div style="' + cssDeclaration(style) + '">' + svg + '</div>')
+        return line('<div style="' + cssAttribute(style) + '">' + svg + '</div>')
       }
 
       const style = Object.assign(exportBoxStyle(layer), exportSizeStyle(layer, computed, inFlex))
@@ -314,7 +324,7 @@
         style.position = 'relative'
       }
       if (!children.length) {
-        return line('<div style="' + cssDeclaration(style) + '"></div>')
+        return line('<div style="' + cssAttribute(style) + '"></div>')
       }
       const childFlex = layer.type === 'frame' && isObject(layer.layout)
       const inner = []
@@ -334,9 +344,9 @@
         const rendered = renderNodeHtml(child, childFlex, depth + 1, pretty, null)
         if (rendered) inner.push(rendered)
       })
-      if (!inner.length) return line('<div style="' + cssDeclaration(style) + '"></div>')
+      if (!inner.length) return line('<div style="' + cssAttribute(style) + '"></div>')
       return [
-        line('<div style="' + cssDeclaration(style) + '">'),
+        line('<div style="' + cssAttribute(style) + '">'),
         inner.join(pretty ? '\n' : ''),
         line('</div>'),
       ].join(pretty ? '\n' : '')
